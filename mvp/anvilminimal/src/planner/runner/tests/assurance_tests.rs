@@ -217,6 +217,7 @@ export default function Memo() {
             final_acceptance_status,
             &release_gate,
             &telemetry,
+            None,
         );
 
         assert_eq!(final_acceptance_status, "incomplete");
@@ -225,6 +226,60 @@ export default function Memo() {
         assert!(reason.contains("browser_readiness_status=not_applicable"));
         assert!(reason.contains("interaction_evidence_status=skipped"));
         assert!(assurance_reason.contains("acceptance_gates_disconnected"));
+    }
+
+    #[test]
+    fn data_assurance_is_earned_from_the_observed_profile_probe_level() {
+        assert_eq!(
+            assurance_for_completion("data", &[]),
+            ("static", "data_profile_probe_not_run")
+        );
+        let release_gate = ReleaseGateSummary {
+            status: "pass".to_string(),
+            reasons: Vec::new(),
+            browser_readiness_status: "not_applicable".to_string(),
+            browser_readiness_evidence_path: String::new(),
+            interaction_evidence_status: "not_applicable".to_string(),
+            interaction_evidence_path: String::new(),
+        };
+        let telemetry = AcceptanceGateTelemetry {
+            browser_readiness_applicable: false,
+            browser_readiness_execution_status: "not_applicable".to_string(),
+            interaction_evidence_applicable: false,
+            interaction_evidence_execution_status: "not_applicable".to_string(),
+        };
+        for (status, expected) in [
+            ("pass", "full"),
+            ("partial", "partial"),
+            ("static", "static"),
+            ("failed", "failed"),
+        ] {
+            let probe = ProfileBehaviorProbeReport {
+                status,
+                reasons: Vec::new(),
+                evidence_path: Some("evidence/data-assurance.json".to_string()),
+            };
+            let (level, _) = earned_assurance_for_completion(
+                "data",
+                &[],
+                true,
+                "full_success",
+                &release_gate,
+                &telemetry,
+                Some(&probe),
+            );
+            assert_eq!(level, expected, "status={status}");
+        }
+        let (unearned, _) = earned_assurance_for_completion(
+            "data",
+            &[],
+            true,
+            "full_success",
+            &release_gate,
+            &telemetry,
+            None,
+        );
+        assert_eq!(unearned, "static");
     }
 
     #[test]

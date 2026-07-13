@@ -22,19 +22,18 @@ knowledge, but it cannot replace Layer-1 behavior with executable text.
 | Section | Layer-2 declaration | Layer-1 owner or reference boundary |
 | --- | --- | --- |
 | `metadata` | Profile `id`, display name, schema version, and admission status. | The loader validates `v0` and `draft`/`admitted`. B-3 may later use `status`; v0 does not gate execution. |
-| `plan` | Preset style, intent, ordered UltraPlan phase ids/prompts, and the literal `{goal}`/`{port}` placeholders. | UltraPlan construction, placeholder expansion, scheduling, and phase execution remain Rust mechanisms. |
+| `plan` | Preset style, intent, ordered UltraPlan phase ids/prompts, the required literal `{goal}` placeholder, and the optional literal `{port}` placeholder. | UltraPlan construction, placeholder expansion, scheduling, and phase execution remain Rust mechanisms. |
 | `step_templates` | Scaffold/build-verification match words, implementation-kill words, ownership markers, and inert template artifact bytes moved from `knowledge.toml`. | Matching precedence, kill decisions, template selection, placeholder expansion, and file writes remain Rust mechanisms. |
 | `vocabulary` | A typed reference to `evidence_knowledge` sections `vocabulary` and `goal_hints.translations`. | The values remain single-sourced in `mvp/anvilminimal/src/minimal_loop/evidence_knowledge.toml`; evidence scanning and translation behavior remain Layer 1. |
 | `guidance` | The `generic`, `canvas_game`, and `persistence` repair variants plus contract wording. | Failure classification, variant selection, ordering, and deduplication remain Rust mechanisms. |
 | `checks` | Named arrays of catalog bindings: an `id` and typed `params`. | `mvp/anvilminimal/src/planner/capability_catalog.rs` owns parameter schemas, validation, adapters, and execution. |
-| `evidence_targets` | A typed reference to the `repair_targets` mapping in `evidence_knowledge`. | The mapping remains single-sourced in the shared TOML; route closure and repair-target selection remain Rust mechanisms. |
+| `evidence_targets` | Either a typed reference to shared `repair_targets` or a profile-local evidence-kind-to-path mapping. | Shared mappings remain single-sourced; local paths are validated as workspace-relative. Route closure and repair-target selection remain Rust mechanisms. |
 
-The vocabulary and evidence-target sections use references instead of copied
-arrays. Copying either section into every profile would create two writable
-sources during the parallel-loader period and allow detection vocabulary to
-drift away from repair targeting. The typed `evidence_knowledge` reference
-keeps the manifest boundary explicit without changing the existing runtime
-loader.
+The vocabulary section uses a reference instead of copied arrays. Next.js also
+references its shared evidence-target mapping. The data profile has different
+repair targets, so it uses the mutually exclusive local mapping form rather
+than copying or modifying the Next.js shared mapping. This keeps each mapping
+single-sourced while preserving a typed manifest boundary.
 
 ## Schema and load contract
 
@@ -51,8 +50,9 @@ The root section list is fixed by
 
 Unknown root or nested fields are rejected. Metadata enums are closed, phase
 ids must be unique, required strings must be non-empty, and `plan.profile`
-must equal `metadata.id`. The two placeholders are literal schema tokens, not
-arbitrary interpolation syntax.
+must equal `metadata.id`. `{goal}` is required; `{port}` may be omitted by a
+profile that has no port semantics, but when present it must be the exact
+literal token. Neither field permits arbitrary interpolation syntax.
 
 Check bindings use TOML arrays under a logical binding name:
 
@@ -106,7 +106,9 @@ declared complete while a row remains `open`.
 
 | Gap id | B-2 requirement and source | Attempted v0 mapping | Missing semantic | Fixture/test | B-4 disposition |
 | --- | --- | --- | --- | --- | --- |
-| _None before B-2_ | — | — | — | — | — |
+| `FG-B2-001` | Data plan/guidance from contract §8 | Populate the existing `step_templates` and T28-shaped `guidance` slots with data keywords and deterministic pipeline guidance. | v0 has Next.js-shaped artifact and guidance field names rather than profile-neutral typed variants; unrelated inert fields must remain empty. | `planner::profiles::data::manifest::tests::manifest_drives_plan_guidance_requirements_and_repair_targets` | `open` |
+| `FG-B2-002` | Contract §1 permits `output/report.{html,md}` | List the stable pipeline/results paths in required artifacts and let the E2 Layer-1 check accept either report path. | v0 artifact lists cannot express an exactly-one-of path requirement without conditional manifest logic. | `planner::profiles::data::runtime::tests::manifest_dispatch_produces_full_only_after_all_checks_pass` | `open` |
+| `FG-B2-003` | Contract §4 earned assurance hierarchy | Bind all checks declaratively, then classify observed check evidence in the typed data runtime adapter. | `full`/`partial`/`static`/`failed` depends on execution history and cannot be safely expressed as manifest branching. | `planner::runner::tests::assurance_tests::moved::data_assurance_is_earned_from_the_observed_profile_probe_level` | `open` |
 
 B-2 の data プロファイル実装は docs/data-profile-contract.md（fixed）に適合しなければならない。契約との不整合はスキーマ側でなく実装側の問題として扱う。
 

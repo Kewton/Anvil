@@ -638,6 +638,10 @@ impl DomainProfile for DataProfile {
         crate::planner::profiles::data::verify(root)
     }
 
+    fn expected_scaffold_paths(&self, _root: &Path, _goal: &str) -> Vec<String> {
+        crate::planner::profiles::data::manifest::required_artifacts()
+    }
+
     fn before_phase(&self, root: &Path) -> anyhow::Result<ProfileSnapshot> {
         let scaffold_paths = self.setup_scaffold_paths(root);
         if !scaffold_paths.is_empty() {
@@ -657,11 +661,68 @@ impl DomainProfile for DataProfile {
         }
     }
 
+    fn guidance(&self, _goal: &str) -> Option<String> {
+        Some(crate::planner::profiles::data::manifest::guidance())
+    }
+
+    fn preset_ultra_plan(&self, goal: &str, style: &str, intent: &str) -> Option<UltraPlan> {
+        crate::planner::profiles::data::manifest::preset_ultra_plan(goal, style, intent)
+    }
+
     fn runtime_contract(&self, _intent: &str, _goal: &str) -> String {
-        "- Preserve raw input data.\n\
-- Write derived outputs to explicit output artifacts.\n\
-- Use deterministic checks for generated files when practical."
-            .to_string()
+        crate::planner::profiles::data::manifest::runtime_contract()
+    }
+
+    fn generation_rules(&self, _intent: &str) -> Option<&'static str> {
+        Some(crate::planner::profiles::data::manifest::generation_rules())
+    }
+
+    fn quality_expectations(&self, _root: &Path, _goal: &str) -> ProfileQualityExpectations {
+        ProfileQualityExpectations {
+            required_artifacts: crate::planner::profiles::data::manifest::required_artifacts(),
+            preferred_verify: Vec::new(),
+            forbidden_verify: vec!["pip install".to_string(), "python -m venv".to_string()],
+            dependency_order_hint: Some(
+                crate::planner::profiles::data::manifest::dependency_order_hint(),
+            ),
+        }
+    }
+
+    fn source_paths(&self, _root: &Path) -> Vec<String> {
+        crate::planner::profiles::data::manifest::source_paths()
+    }
+
+    fn evidence_repair_target_paths(&self, _root: &Path, evidence_keys: &[String]) -> Vec<String> {
+        crate::planner::profiles::data::manifest::evidence_target_paths(evidence_keys)
+    }
+
+    fn infer_required_capabilities(&self, _goal: &str) -> Vec<String> {
+        crate::planner::profiles::data::manifest::required_capability_ids()
+    }
+
+    fn infer_required_obligations(
+        &self,
+        _goal: &str,
+        _required_capabilities: &[String],
+    ) -> Vec<String> {
+        vec!["implementation".to_string()]
+    }
+
+    fn behavior_probe(
+        &self,
+        root: &Path,
+        _goal: &str,
+        _required_capabilities: &[String],
+        _offline: bool,
+    ) -> anyhow::Result<ProfileBehaviorProbeReport> {
+        let summary = crate::planner::profiles::data::runtime::run_manifest_checks(root)?;
+        Ok(ProfileBehaviorProbeReport {
+            status: summary.assurance.behavior_status(),
+            reasons: summary.reasons,
+            evidence_path: Some(
+                crate::planner::profiles::data::runtime::DATA_ASSURANCE_EVIDENCE_PATH.to_string(),
+            ),
+        })
     }
 }
 

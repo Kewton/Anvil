@@ -793,12 +793,26 @@ pub(super) fn ultra_final_acceptance_report_inner(
     let profile_behavior_failed = profile_behavior_probe.status == "failed";
     if profile_behavior_failed {
         mark_release_gate_profile_behavior_failed(&mut release_gate, &profile_behavior_probe);
+    } else if matches!(profile_behavior_probe.status, "partial" | "static") {
+        release_gate.status = "partial".to_string();
+        release_gate.reasons = dedup_strings(
+            release_gate
+                .reasons
+                .iter()
+                .cloned()
+                .chain(std::iter::once(format!(
+                    "profile_behavior_probe_{}",
+                    profile_behavior_probe.status
+                )))
+                .collect(),
+        );
     }
     let final_acceptance_status = release_gate_final_acceptance_status(&release_gate);
-    let runtime_acceptance_status = if profile_behavior_failed {
-        "failed"
-    } else {
-        runtime_acceptance_status(acceptance.passed, Some(&acceptance))
+    let runtime_acceptance_status = match profile_behavior_probe.status {
+        "failed" => "failed",
+        "partial" => "partial",
+        "static" => "static",
+        _ => runtime_acceptance_status(acceptance.passed, Some(&acceptance)),
     };
     let (assurance_level, assurance_reason) = earned_assurance_for_completion(
         &effective_profile,
@@ -807,6 +821,7 @@ pub(super) fn ultra_final_acceptance_report_inner(
         final_acceptance_status,
         &release_gate,
         &gate_telemetry,
+        Some(&profile_behavior_probe),
     );
     let release_quality_completion =
         release_quality_completion_status(&release_gate, final_acceptance_status);

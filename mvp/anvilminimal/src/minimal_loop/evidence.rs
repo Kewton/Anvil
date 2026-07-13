@@ -1012,7 +1012,9 @@ pub fn verify_runtime_acceptance_with_browser_dirs_and_hints(
     let mut missing_capabilities = Vec::new();
     for capability in required_capabilities {
         let kinds = evidence_kinds_for_capability(capability);
-        if kinds.is_empty() {
+        if kinds.is_empty()
+            && !crate::planner::profiles::data::manifest::is_manifest_check_id(capability)
+        {
             missing_capabilities.push(format!("unsupported_required_capability:{capability}"));
         }
         for kind in kinds {

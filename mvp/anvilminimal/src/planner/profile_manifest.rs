@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::OnceLock;
 
@@ -6,6 +6,8 @@ use serde::Deserialize;
 use toml::value::Table;
 
 use crate::planner::capability_catalog::{self, CatalogError, ResolvedCapability};
+
+mod validation;
 
 const NEXTJS_MANIFEST_TOML: &str = include_str!("profiles/nextjs/manifest.toml");
 
@@ -84,7 +86,8 @@ pub struct ManifestPlan {
 #[serde(deny_unknown_fields)]
 pub struct PlanPlaceholders {
     pub goal: String,
-    pub port: String,
+    #[serde(default)]
+    pub port: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -250,8 +253,12 @@ pub struct CheckBinding {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EvidenceTargetsReference {
-    pub source: SharedKnowledgeSource,
-    pub section: EvidenceTargetsSection,
+    #[serde(default)]
+    pub source: Option<SharedKnowledgeSource>,
+    #[serde(default)]
+    pub section: Option<EvidenceTargetsSection>,
+    #[serde(default)]
+    pub mappings: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -346,75 +353,7 @@ impl ManifestV0 {
     }
 
     fn validate_structure(&self) -> Result<(), ManifestError> {
-        require_non_empty("metadata.id", &self.metadata.id)?;
-        require_non_empty("metadata.display_name", &self.metadata.display_name)?;
-        require_non_empty("plan.profile", &self.plan.profile)?;
-        require_non_empty("plan.style", &self.plan.style)?;
-        require_non_empty("plan.intent", &self.plan.intent)?;
-        if self.plan.profile != self.metadata.id {
-            return Err(invalid(
-                "plan.profile",
-                "must match metadata.id for schema v0",
-            ));
-        }
-        if self.plan.placeholders.goal != "{goal}" {
-            return Err(invalid(
-                "plan.placeholders.goal",
-                "must be the literal {goal}",
-            ));
-        }
-        if self.plan.placeholders.port != "{port}" {
-            return Err(invalid(
-                "plan.placeholders.port",
-                "must be the literal {port}",
-            ));
-        }
-        if self.plan.phases.is_empty() {
-            return Err(invalid("plan.phases", "must contain at least one phase"));
-        }
-        let mut phase_ids = BTreeSet::new();
-        for phase in &self.plan.phases {
-            require_non_empty("plan.phases[].id", &phase.id)?;
-            require_non_empty("plan.phases[].prompt", &phase.prompt)?;
-            if !phase_ids.insert(phase.id.as_str()) {
-                return Err(invalid("plan.phases[].id", "phase ids must be unique"));
-            }
-        }
-        let vocabulary_sections = self
-            .vocabulary
-            .sections
-            .iter()
-            .copied()
-            .collect::<BTreeSet<_>>();
-        if vocabulary_sections
-            != BTreeSet::from([
-                VocabularySection::Vocabulary,
-                VocabularySection::GoalHintTranslations,
-            ])
-        {
-            return Err(invalid(
-                "vocabulary.sections",
-                "must reference vocabulary and goal_hints.translations",
-            ));
-        }
-        if self.checks.is_empty() {
-            return Err(invalid("checks", "must contain at least one binding"));
-        }
-        for (binding, checks) in &self.checks {
-            if binding.trim().is_empty() {
-                return Err(invalid("checks", "binding names may not be empty"));
-            }
-            if checks.is_empty() {
-                return Err(invalid(
-                    "checks.<binding>",
-                    "must contain at least one check",
-                ));
-            }
-            for check in checks {
-                require_non_empty("checks.<binding>[].id", &check.id)?;
-            }
-        }
-        Ok(())
+        validation::validate(self)
     }
 }
 
@@ -424,21 +363,6 @@ pub fn nextjs_manifest() -> &'static ManifestV0 {
         ManifestV0::from_toml(NEXTJS_MANIFEST_TOML)
             .expect("embedded Next.js profile manifest.toml must parse and resolve")
     })
-}
-
-fn require_non_empty(field: &'static str, value: &str) -> Result<(), ManifestError> {
-    if value.trim().is_empty() {
-        Err(invalid(field, "must not be empty"))
-    } else {
-        Ok(())
-    }
-}
-
-fn invalid(field: &'static str, reason: impl Into<String>) -> ManifestError {
-    ManifestError::Invalid {
-        field,
-        reason: reason.into(),
-    }
 }
 
 #[cfg(test)]

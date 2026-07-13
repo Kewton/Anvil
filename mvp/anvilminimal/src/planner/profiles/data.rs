@@ -6,7 +6,9 @@ use crate::planner::verify::VerificationReport;
 
 pub mod checks;
 mod claims_binding;
+pub mod manifest;
 pub mod results_schema;
+pub mod runtime;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProfileSnapshot {
@@ -149,5 +151,42 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("output")).unwrap();
         std::fs::write(dir.path().join("output/result.csv"), "ok").unwrap();
         assert!(after_phase(dir.path(), &snapshot).is_pass());
+    }
+
+    #[test]
+    fn domain_profile_hooks_are_supplied_by_the_embedded_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = crate::planner::profile::domain_profile("data");
+
+        assert_eq!(profile.guidance("goal"), Some(manifest::guidance()));
+        assert_eq!(
+            profile.runtime_contract("create", "goal"),
+            manifest::runtime_contract()
+        );
+        assert_eq!(
+            profile.generation_rules("create"),
+            Some(manifest::generation_rules())
+        );
+        assert_eq!(
+            profile
+                .preset_ultra_plan("Analyze sales", "default", "create")
+                .unwrap(),
+            manifest::preset_ultra_plan("Analyze sales", "default", "create").unwrap()
+        );
+        assert_eq!(
+            profile.expected_scaffold_paths(dir.path(), "goal"),
+            manifest::required_artifacts()
+        );
+        assert_eq!(
+            profile.infer_required_capabilities("goal"),
+            manifest::required_capability_ids()
+        );
+        assert_eq!(
+            profile.evidence_repair_target_paths(
+                dir.path(),
+                &["reconciliation_violation".to_string()]
+            ),
+            ["pipeline/main.py"]
+        );
     }
 }

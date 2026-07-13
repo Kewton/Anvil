@@ -1,0 +1,134 @@
+[metadata]
+id = "data"
+display_name = "Tabular Data Pipeline"
+schema_version = "v0"
+status = "draft"
+
+[plan]
+profile = "data"
+style = "default"
+intent = "create"
+
+[plan.placeholders]
+goal = "{goal}"
+
+[[plan.phases]]
+id = "data-inspection"
+prompt = "Inspect the workspace CSV or TSV input for: {goal}. Identify columns, row counts, types, ranges, duplicate-key candidates, and date boundaries without modifying the input."
+
+[[plan.phases]]
+id = "data-cleaning"
+prompt = "Implement deterministic cleaning in pipeline/main.py. Account for every excluded row by a non-empty reason and preserve raw input files. Use Python 3 standard-library modules only."
+
+[[plan.phases]]
+id = "data-aggregation"
+prompt = "Compute the requested aggregates for: {goal}. Write every reportable numeric result under output/results.json values and keep reconciliation row counts in the fixed schema."
+
+[[plan.phases]]
+id = "data-reporting"
+prompt = "Generate output/report.md or output/report.html from the computed results. Interpolate numeric claims from output/results.json; do not write independent numeric literals into report prose."
+
+[[plan.phases]]
+id = "data-validation"
+prompt = "Run the manifest-bound pipeline, result-schema, reconciliation, claims-binding, and rerun-consistency checks. Do not claim full assurance unless every bound check passes from observed artifacts."
+
+[step_templates.scaffold]
+phase = ["data inspection", "inspect data", "CSV", "TSV", "データ検分"]
+phase_id = ["data-inspection"]
+port_phase_markers = []
+port_script_phase = []
+
+[step_templates.build_verify]
+phase = ["data validation", "pipeline validation", "reconciliation", "claims binding", "rerun consistency", "検証"]
+
+[step_templates.implementation_kill]
+phase = ["cleaning", "aggregation", "reporting", "クリーニング", "集計", "レポート"]
+
+[step_templates.ownership.setup_classifier]
+package_phrases = ["pipeline/main.py", "output/results.json", "output/report.md"]
+package_tokens = ["pipeline", "results", "report"]
+scaffold_phrases = ["CSV", "TSV", "tabular data"]
+scaffold_tokens = ["data"]
+scaffold_setup_markers = ["inspect", "inspection"]
+scaffold_project_marker = "pipeline"
+scaffold_dependency_exclusion = "pip install"
+
+[step_templates.ownership.template_owned_artifacts]
+package_phrases = ["pipeline/main.py"]
+package_tokens = ["pipeline"]
+scaffold_phrases = ["output/results.json", "output/report.md", "output/report.html"]
+scaffold_tokens = ["results", "report"]
+package_manifest_names = []
+artifact_path_suffixes = ["pipeline/main.py", "output/results.json", "output/report.md", "output/report.html"]
+artifact_path_contains = []
+package_check_marker = "pipeline entry"
+scaffold_check_marker = "data output artifacts"
+
+[step_templates.artifacts]
+package_script_build = ""
+package_script_dev = ""
+package_script_start = ""
+required_hooks = []
+scaffold_files = ["pipeline/main.py", "output/results.json", "output/report.md"]
+tailwind_config_rels = []
+tailwind_config = ""
+tailwind_config_cjs = ""
+package_json = ""
+tsconfig = ""
+postcss_config = ""
+tailwind_css = ""
+global_d_ts = ""
+layout_tsx = ""
+
+[vocabulary]
+source = "evidence_knowledge"
+sections = ["vocabulary", "goal_hints.translations"]
+
+[guidance.generic]
+generic_interaction = "Build one reproducible tabular-data pipeline with Python 3 standard-library csv/json/statistics only. Preserve input files and write pipeline/main.py, output/results.json, and one output/report artifact."
+start_interaction = "The pipeline must be deterministic: use a fixed seed whenever randomness is unavoidable, do not depend on execution time, and keep iteration and output ordering stable. This is class knowledge required by docs/data-profile-contract.md section 8."
+
+[guidance.canvas_game]
+canvas_game_interaction = "All report numeric claims must be derived from output/results.json values."
+canvas_render_loop_checklist = "Reconcile input rows to used rows plus reasoned exclusions before reporting."
+canvas_input_wiring_checklist = "Keep the input file workspace-local and never modify raw input data."
+
+[guidance.persistence]
+persistence = "A rerun must reproduce the complete output/results.json document exactly; time, random state, and unstable iteration order may not change results."
+
+[guidance.contracts]
+state_binding_contract = "output/results.json is the sole machine-readable source for report numeric claims."
+input_coupled_dimension_requirement = "input_rows must equal used_rows plus the sum of excluded rows."
+contract_attribute_missing_kind = "data_contract_evidence_missing"
+contract_attribute_guidance = "Repair pipeline/main.py or its generated artifacts; never weaken the evidence checks."
+state_requirement = "Write reconciliation and values using the fixed results schema."
+restart_requirement = "Rerun the same pipeline entry for reproducibility evidence."
+input_requirement = "Read a single workspace CSV or TSV input with Python standard-library modules."
+primary_requirement = "Generate pipeline/main.py, output/results.json, and output/report.md or output/report.html."
+state_example = "{\"reconciliation\":{\"input_rows\":3,\"used_rows\":2,\"excluded\":[{\"reason\":\"missing amount\",\"rows\":1}]},\"values\":{\"total\":12.5}}"
+restart_example = "rerun the manifest-bound pipeline entry"
+input_example = "input/source.csv"
+primary_example = "pipeline/main.py"
+
+[[checks.execution]]
+id = "pipeline_probe"
+params = { entry = "pipeline/main.py", timeout_seconds = 30 }
+
+[[checks.evidence]]
+id = "data_results_schema"
+
+[[checks.evidence]]
+id = "data_reconciliation"
+
+[[checks.evidence]]
+id = "data_claims_binding"
+
+[[checks.reproducibility]]
+id = "data_rerun_consistency"
+params = { entry = "pipeline/main.py", timeout_seconds = 30 }
+
+[evidence_targets.mappings]
+results_schema = ["pipeline/main.py"]
+reconciliation = ["pipeline/main.py"]
+claims_binding = ["pipeline/main.py"]
+rerun_consistency = ["pipeline/main.py"]
