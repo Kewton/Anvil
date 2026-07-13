@@ -1,0 +1,36 @@
+case_id = "test0713_profile_manifest_v0"
+source = "profile manifest v0 schema and parallel-loader contract"
+required_paths = []
+verify_commands = []
+required_capabilities = []
+required_evidence = []
+required_obligations = []
+deferred_verify_requirements = []
+evidence_hint_tokens = ["profile_manifest", "schema_v0", "capability_catalog"]
+
+[route_closure]
+include = []
+exclude = []
+
+[weak_evidence]
+contains = []
+
+[diagnostics]
+contains = []
+
+[compile]
+expect = "not_checked"
+
+[fixture_contains]
+fixtures/profile-manifest-v0-contract.jsonl = [
+  "\"event\":\"profile_manifest_v0_contract\"",
+  "\"schema_version\":\"v0\"",
+  "\"root_sections\":[\"metadata\",\"plan\",\"step_templates\",\"vocabulary\",\"guidance\",\"checks\",\"evidence_targets\"]",
+  "\"status_values\":[\"draft\",\"admitted\"]",
+  "\"source\":\"evidence_knowledge\"",
+  "\"catalog_resolved_at_load\":true",
+  "\"unknown_id\":\"reject\"",
+  "\"invalid_params\":\"reject\"",
+  "\"runtime_wired\":false",
+  "mvp/anvilminimal/docs/profile-manifest.md#format-gap-ledger"
+]
