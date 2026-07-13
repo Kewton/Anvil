@@ -7,6 +7,7 @@ pub mod intent;
 pub(crate) mod interaction_repair;
 pub mod lint;
 pub mod profile;
+pub mod profile_manifest;
 pub mod repair;
 pub mod repair_targeting;
 pub mod runner;

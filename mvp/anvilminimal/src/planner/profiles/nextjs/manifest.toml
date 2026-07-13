@@ -1,0 +1,314 @@
+[metadata]
+id = "nextjs"
+display_name = "Next.js"
+schema_version = "v0"
+status = "draft"
+
+[plan]
+profile = "nextjs"
+style = "default"
+intent = "create"
+
+[plan.placeholders]
+goal = "{goal}"
+port = "{port}"
+
+[[plan.phases]]
+id = "project-setup"
+prompt = "Scaffold and setup the Next.js App Router project shell. Create or complete the package manifest, TypeScript config, styling config, and route-bound scaffold so the deterministic nextjs-scaffold template owns setup artifacts."
+
+[[plan.phases]]
+id = "core-implementation"
+prompt = "Implement the core task-specific behavior for: {goal}. Keep one route-bound implementation, extend the instrumented skeleton instead of replacing it, and keep the implementation in the Next.js route-bound source."
+
+[[plan.phases]]
+id = "contract-wiring"
+prompt = '''Wire controls and data-anvil observability. Preserve or add data-anvil-action="primary" on the main start/submit/action control, data-anvil-action="input" on the main text entry surface when one exists, and data-anvil-state with a JSON snapshot of meaningful visible state. The data-anvil-state snapshot must include at least one dimension that immediately responds to input, such as player/paddle x position. When the contract includes start_or_restart_flow, every restart affordance (game-over, victory, and in-play when present) should carry data-anvil-action="restart"; the initial primary action alone cannot satisfy recovery verification.'''
+
+[[plan.phases]]
+id = "build-verification"
+prompt = "Run build verification for the deterministic Next.js scaffold. Verify package scripts, dependency boundary, and npm run build / next build only; keep this final phase verification-only."
+
+[step_templates.scaffold]
+phase = [
+  "scaffold",
+  "setup",
+  "set up",
+  "project shell",
+  "initialize",
+  "initialise",
+  "bootstrap",
+  "app router scaffold",
+  "初期",
+  "セットアップ",
+]
+phase_id = [
+  "scaffold",
+  "setup",
+  "set-up",
+  "project-setup",
+  "bootstrap",
+  "initialize",
+  "initialise",
+]
+port_phase_markers = ["port", "ポート"]
+port_script_phase = [
+  "script",
+  "package",
+  "package.json",
+  "dev/start",
+  "dev script",
+  "start script",
+  "設定",
+]
+
+[step_templates.build_verify]
+phase = [
+  "build verification",
+  "verify build",
+  "build verifier",
+  "npm run build",
+  "next build",
+  "ビルド検証",
+]
+
+[step_templates.implementation_kill]
+phase = [
+  "game logic",
+  "gameplay",
+  "mechanic",
+  "adversary",
+  "challenge",
+  "collision",
+  "failure rule",
+  "score",
+  "player control",
+  "canvas",
+  "stateful update",
+  "user input",
+  "interactive surface",
+  "ゲームロジック",
+  "衝突",
+  "スコア",
+  "敵",
+  "プレイヤー",
+  "操作",
+]
+
+[step_templates.ownership.setup_classifier]
+package_phrases = ["package.json", "package manifest", "package script", "port script"]
+package_tokens = ["script", "scripts", "manifest", "port"]
+scaffold_phrases = ["scaffold", "project shell", "tsconfig", "postcss", "tailwind"]
+scaffold_tokens = ["config"]
+scaffold_setup_markers = ["setup", "set up"]
+scaffold_project_marker = "project"
+scaffold_dependency_exclusion = "dependenc"
+
+[step_templates.ownership.template_owned_artifacts]
+package_phrases = [
+  "package.json",
+  "package manifest",
+  "package script",
+  "npm script",
+  "port script",
+  "dev script",
+  "start script",
+  "build script",
+]
+package_tokens = ["scripts", "port", "ports"]
+scaffold_phrases = [
+  "tsconfig",
+  "postcss",
+  "tailwind",
+  "next.config",
+  "next-env.d.ts",
+  "src/app/layout.tsx",
+  "src/app/globals.css",
+  "src/app/global.d.ts",
+]
+scaffold_tokens = ["scaffold", "scaffolding"]
+package_manifest_names = ["package.json"]
+artifact_path_suffixes = [
+  "tsconfig.json",
+  "next-env.d.ts",
+  "src/app/layout.tsx",
+  "src/app/globals.css",
+  "src/app/global.d.ts",
+]
+artifact_path_contains = ["postcss.config.", "tailwind.config.", "next.config."]
+package_check_marker = "package.json scripts port"
+scaffold_check_marker = "scaffold tsconfig postcss tailwind"
+
+[step_templates.artifacts]
+package_script_build = "next build"
+package_script_dev = "next dev -p {port}"
+package_script_start = "next start -p {port}"
+required_hooks = [
+  '''data-anvil-action="primary"''',
+  '''data-anvil-action="restart"''',
+  "data-anvil-state",
+]
+scaffold_files = [
+  "package.json",
+  "tsconfig.json",
+  "postcss.config.js",
+  "{tailwind_config}",
+  "src/app/layout.tsx",
+  "src/app/page.tsx",
+  "src/app/globals.css",
+  "src/app/global.d.ts",
+]
+tailwind_config_rels = [
+  "tailwind.config.ts",
+  "tailwind.config.js",
+  "tailwind.config.cjs",
+  "tailwind.config.mjs",
+]
+tailwind_config = '''import type { Config } from "tailwindcss";
+
+const config: Config = {
+  content: [
+    "./src/pages/**/*.{js,ts,jsx,tsx,mdx}",
+    "./src/components/**/*.{js,ts,jsx,tsx,mdx}",
+    "./src/app/**/*.{js,ts,jsx,tsx,mdx}",
+  ],
+  theme: { extend: {} },
+  plugins: [],
+};
+
+export default config;
+'''
+tailwind_config_cjs = '''module.exports = {
+  content: [
+    "./src/pages/**/*.{js,ts,jsx,tsx,mdx}",
+    "./src/components/**/*.{js,ts,jsx,tsx,mdx}",
+    "./src/app/**/*.{js,ts,jsx,tsx,mdx}",
+  ],
+  theme: { extend: {} },
+  plugins: [],
+};
+'''
+package_json = '''{
+  "name": "anvilminimal-nextjs-app",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "next": "^14.2.0",
+    "react": "^18.3.0",
+    "react-dom": "^18.3.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@types/react": "^18.3.0",
+    "@types/react-dom": "^18.3.0",
+    "autoprefixer": "^10.4.20",
+    "postcss": "^8.5.15",
+    "tailwindcss": "^3.4.19",
+    "typescript": "^5.5.0"
+  },
+  "scripts": {
+    "build": "next build",
+    "dev": "next dev -p 3011",
+    "start": "next start -p 3011"
+  }
+}
+'''
+tsconfig = '''{"compilerOptions":{"target":"ES2017","lib":["dom","dom.iterable","esnext"],"allowJs":true,"skipLibCheck":true,"strict":true,"noEmit":true,"esModuleInterop":true,"module":"esnext","moduleResolution":"bundler","resolveJsonModule":true,"isolatedModules":true,"jsx":"preserve","incremental":true,"plugins":[{"name":"next"}],"baseUrl":".","paths":{"@/*":["./src/*"]}},"include":["next-env.d.ts","**/*.ts","**/*.tsx",".next/types/**/*.ts"],"exclude":["node_modules"]}'''
+postcss_config = '''module.exports = { plugins: { tailwindcss: {}, autoprefixer: {} } };
+'''
+tailwind_css = '''@tailwind base;
+@tailwind components;
+@tailwind utilities;
+'''
+global_d_ts = '''declare module "*.css";
+'''
+layout_tsx = '''import type { Metadata } from "next";
+import "./globals.css";
+
+export const metadata: Metadata = {
+  title: "Interactive Challenge",
+  description: "A compact interactive challenge generated by anvilminimal",
+};
+
+export default function RootLayout({
+  children,
+}: Readonly<{ children: React.ReactNode }>) {
+  return (
+    <html lang="en">
+      <body>{children}</body>
+    </html>
+  );
+}
+'''
+
+[vocabulary]
+source = "evidence_knowledge"
+sections = ["vocabulary", "goal_hints.translations"]
+
+[guidance.generic]
+generic_interaction = "input operations must visibly change actual application state, and that change must be reflected in the data-anvil-state JSON snapshot; wire input handlers to state updates."
+start_interaction = "primary/start controls must transition the visible app state before input is evaluated; wire the start action into state and render updates."
+
+[guidance.canvas_game]
+canvas_game_interaction = "keyboard or pointer input must visibly change game state (player position, projectiles, score/health, or state transitions); wire input handlers into the render/update loop."
+canvas_render_loop_checklist = "render-loop checklist: ref attached -> effect runs -> rAF loop starts -> draw calls"
+canvas_input_wiring_checklist = "input-wiring checklist: keyboard or pointer input must visibly change game state (player position, projectiles, score/health, or state transitions); wire input handlers into the render/update loop."
+
+[guidance.persistence]
+persistence = "load persisted state on mount (e.g. read localStorage in initialization) and write on mutation"
+
+[guidance.contracts]
+state_binding_contract = '''Minimum contract: after start and after input, the `data-anvil-state` JSON value must actually change. The snapshot must include at least one dimension that immediately responds to input, such as player/paddle x position. If refs are used, mirror meaningful state changes into React state so a render occurs.'''
+input_coupled_dimension_requirement = "入力は {mutation_refs} を変異させるが data-anvil-state に映らない。入力連動次元（例: プレイヤー/パドルのx座標）をReact stateにミラーしてスナップショットへ追加せよ。"
+contract_attribute_missing_kind = "contract_attribute_missing"
+contract_attribute_guidance = '''Contract attribute repair guidance:
+- classification: {classification}
+- missing attribute: `{attribute}`
+- target source file: `{path}`
+- contract requirement: {requirement}
+- location directive: add the missing attribute to the route-bound container, control, or status element in the same rendered hierarchy as the existing hooks below.
+Existing hook locations:
+{excerpts}
+Generic one-line example:
+- {example}
+'''
+state_requirement = "provide a meaningful visible-state JSON snapshot after each render, and include at least one input-coupled dimension such as a player or paddle x coordinate."
+restart_requirement = "mark every restart, retry, or new-game affordance that resets observable state; the primary action alone is not restart evidence."
+input_requirement = "mark the main text entry surface when one exists so interaction probes can target input behavior."
+primary_requirement = "mark the main start, submit, or primary action control so interaction probes can start the experience deterministically."
+state_example = '''data-anvil-state={JSON.stringify({ phase, score, playerX })}'''
+restart_example = '''data-anvil-action="restart"'''
+input_example = '''data-anvil-action="input"'''
+primary_example = '''data-anvil-action="primary"'''
+
+[[checks.project-setup]]
+id = "package_json_port_script"
+params = { port = 3011 }
+
+[[checks.project-setup]]
+id = "package_json_script_matches"
+params = { pattern = "next build" }
+
+[[checks.project-setup]]
+id = "scaffold_files_present"
+params = { files = ["package.json", "tsconfig.json", "postcss.config.js", "tailwind.config.ts", "src/app/layout.tsx", "src/app/page.tsx", "src/app/globals.css", "src/app/global.d.ts"] }
+
+[[checks.contract-wiring]]
+id = "hook_attribute_present"
+params = { attribute = "action", value = "primary", path = "src/app/page.tsx" }
+
+[[checks.contract-wiring]]
+id = "hook_attribute_present"
+params = { attribute = "action", value = "restart", path = "src/app/page.tsx" }
+
+[[checks.contract-wiring]]
+id = "hook_attribute_present"
+params = { attribute = "state", value = "", path = "src/app/page.tsx" }
+
+[[checks.build-verification]]
+id = "next_build_verify"
+params = {}
+
+[evidence_targets]
+source = "evidence_knowledge"
+section = "repair_targets"
