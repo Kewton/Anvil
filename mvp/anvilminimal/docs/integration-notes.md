@@ -97,6 +97,17 @@ T27 status: REOPENED -> CLOSED (root-caused, fixed by T27)。
 再確認した。確定`state_binding_diagnosis`のpathを最優先ターゲットへ接続し、
 interaction failureのevidence mappingとcontract hook guidanceも接続して閉鎖した。
 
+### Probe Input Game Assumption [WITHDRAWN]
+
+WITHDRAWN (attempted 2026-07-13, reverted on parity gate failure, see ledger
+T29)。過適応監査項目: プローブ入力のゲーム前提、具体的には
+`interaction_probe` の ArrowLeft/ArrowRight/Space dispatch 直書き。
+契約駆動dispatch化を試行したが、パリティゲートが2回とも5/6一致で止まり、
+Space/qwen35 と Breakout/qwen35 が偽陰性化した。現行のゲーム入力判定は
+dispatch直後のlistener/rAFタイミングと結合しているため、再訪時は
+listener登録待ち・rAF同期・リトライ付きdispatchを含むタイミングモデル再設計を
+前提にする。
+
 ### Dependency Setup Network Stall [OPEN (low priority)]
 
 依存セットアップのネットワーク停滞は低優先度のままOPENとする。既存の

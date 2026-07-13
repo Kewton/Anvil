@@ -267,3 +267,12 @@ Both report directories below were present when this closure was recorded.
 知識のRust所有境界（nextjs.rs / evidence.rs）に個別成長予算が存在する。
 知識TOML自体に個別行数予算はないが、知識の変更は `knowledge.toml` 編集＋
 シナリオ行列回帰が正規手順となる。
+
+## Post-closure task ledger (2026-07-13)
+
+| ID | 機構 | コミット | 動機 | 検証 | 状態 |
+|---|---|---|---|---|---|
+| T29 | プローブdispatch契約駆動化 | なし（試行→全revert） | 過適応監査: `interaction_probe` のゲーム操作直書き（ArrowLeft/ArrowRight/Space）の宣言化 | パリティ計測5/6×2回で退行（Space/qwen35、Breakout/qwen35 が偽陰性化）。ゲーム入力判定がdispatch直後のlistener/rAFタイミングと癒着しており、宣言化にはプローブのタイミングモデル再設計が必要と判明 | **withdrawn** |
+
+- 据え置きの根拠: 実害ゼロ（非ゲームは候補要素クリック経路が補完、バンド窓78runで本件起因の偽陰性/偽陽性ゼロ）に対し、修正には裁定層のタイミング再設計を要するため、コストが見合わない。
+- 再訪条件: (a) 第4のシナリオ族でdispatch不足起因の偽陰性が実測されたとき、(b) 近縁profile（Vue等）がプローブ拡張を要求したとき。再訪時はタイミングモデル再設計（listener登録待ち・rAF同期・リトライ付きdispatch）を含む適正スコープで行う。
