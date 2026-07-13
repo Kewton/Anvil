@@ -9,6 +9,7 @@ mod claims_binding;
 pub mod manifest;
 pub mod results_schema;
 pub mod runtime;
+pub(crate) mod step_policy;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProfileSnapshot {

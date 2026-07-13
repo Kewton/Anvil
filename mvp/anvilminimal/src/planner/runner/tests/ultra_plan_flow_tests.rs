@@ -156,6 +156,7 @@ Phase task: Implement game logic, player control, collision, score, and canvas b
         assert_eq!(plan.steps[0].id, "setup-nextjs");
         assert_eq!(plan.steps[0].kind, "verify");
         assert!(setup_step_policy::step_short_circuit_precheck_applicable(
+            "nextjs",
             &plan.steps[0]
         ));
         let event_text = std::fs::read_to_string(events).unwrap();

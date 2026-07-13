@@ -601,6 +601,12 @@ fn verify_step_with_setup_observed_with_options(
             report.push_missing_path(path.clone());
         }
     }
+    crate::planner::profiles::data::step_policy::run_step_catalog_checks(
+        root,
+        profile,
+        step,
+        &mut report,
+    );
     let prepared_verify = prepare_verify_commands_with_install_substitution(
         root,
         step,
@@ -763,6 +769,9 @@ fn prepare_verify_commands_with_install_substitution(
 ) -> Vec<NormalizedVerifyCommand> {
     let mut out = Vec::new();
     for raw_command in &step.verify {
+        if crate::planner::profiles::data::step_policy::catalog_check_id(raw_command).is_some() {
+            continue;
+        }
         match normalize_verify_command(raw_command) {
             Ok(command) => {
                 out.push(command);

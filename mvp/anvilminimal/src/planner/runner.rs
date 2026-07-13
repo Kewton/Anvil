@@ -2081,6 +2081,7 @@ fn run_step(
             &config.profile,
             &prompt_context.overall_goal,
             step,
+            config.eval_events_path.as_deref(),
         );
     let instruction = build_step_prompt(plan, &runtime_step, prompt_context, config.prompt_layout);
     emit_step_prompt_contract(config, &runtime_step, prompt_context, &instruction);
@@ -2111,7 +2112,7 @@ fn run_step(
         contract_setup_authority,
     )
     .with_required_mutation_before_short_circuit(synthesized_precheck);
-    if setup_step_policy::step_short_circuit_precheck_applicable(&runtime_step) {
+    if setup_step_policy::step_short_circuit_precheck_applicable(&config.profile, &runtime_step) {
         let (report, build_lifecycles) = verify_step_completion_observed(
             config,
             &runtime_step,

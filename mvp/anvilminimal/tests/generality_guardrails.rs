@@ -268,6 +268,36 @@ fn runner_chokepoints_do_not_grow_past_interim_budget() {
             production_baseline: 248,
             test_baseline: 96,
         },
+        ChokepointBudget {
+            path: "src/planner/setup_step_policy.rs",
+            total_baseline: 910,
+            production_baseline: 417,
+            test_baseline: 493,
+        },
+        ChokepointBudget {
+            path: "src/planner/lint.rs",
+            total_baseline: 2_144,
+            production_baseline: 1_097,
+            test_baseline: 1_047,
+        },
+        ChokepointBudget {
+            path: "src/planner/verify.rs",
+            total_baseline: 4_757,
+            production_baseline: 3_029,
+            test_baseline: 1_728,
+        },
+        ChokepointBudget {
+            path: "src/planner/profiles/data.rs",
+            total_baseline: 193,
+            production_baseline: 104,
+            test_baseline: 89,
+        },
+        ChokepointBudget {
+            path: "src/planner/profiles/data/step_policy.rs",
+            total_baseline: 634,
+            production_baseline: 470,
+            test_baseline: 164,
+        },
     ] {
         let text = std::fs::read_to_string(budget.path)
             .unwrap_or_else(|err| panic!("failed to read {}: {err}", budget.path));

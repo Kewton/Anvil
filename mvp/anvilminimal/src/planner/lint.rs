@@ -236,6 +236,9 @@ pub fn lint_step_plan_report_with_workspace(
             }
         }
         for command in &step.verify {
+            if crate::planner::profiles::data::step_policy::catalog_check_id(command).is_some() {
+                continue;
+            }
             if crate::planner::verify::dependency_install_verify_segment(command).is_some() {
                 continue;
             }
