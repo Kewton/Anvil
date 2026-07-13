@@ -12,6 +12,7 @@ pub mod feedback;
 pub mod import_scan;
 pub mod interaction_probe;
 pub mod loop_run;
+pub mod pipeline_probe;
 pub mod probe_preflight;
 pub mod prompt;
 pub mod reachability;
