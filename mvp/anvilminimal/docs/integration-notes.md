@@ -112,3 +112,9 @@ listener登録待ち・rAF同期・リトライ付きdispatchを含むタイミ�
 
 依存セットアップのネットワーク停滞は低優先度のままOPENとする。既存の
 600秒setup timeoutとネットワーク制限下の待機挙動はこの棚卸しでは変更しない。
+
+### Data Goal Feature Stopword Noise [OPEN (low priority)]
+
+DATA-5。dataゴールの特徴抽出で英語ストップワードが60個超のノイズとして
+生成される事象を記録する。B-2bではdata manifestの知識注入・検証正準化・
+dependency拒否フィードバックを優先し、この特徴抽出ロジックは変更しない。

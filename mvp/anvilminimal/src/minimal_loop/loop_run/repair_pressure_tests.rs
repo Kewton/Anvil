@@ -1020,6 +1020,7 @@ export default function Page(){
         .unwrap();
         let events = dir.path().join("events.jsonl");
         let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "nextjs".to_string();
         cfg.eval_events_path = Some(events.clone());
         let port_check = "node -p \"require('./package.json').scripts.dev.includes('-p 3011') ? true : process.exit(1)\"";
         let mut fake = Fake::new(vec![

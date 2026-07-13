@@ -126,6 +126,7 @@ fn build_repair_prompt_stable(
         prompt.push_str("\n\n");
         prompt.push_str(&contract_attribute_guidance);
     }
+    append_profile_repair_guidance(&mut prompt, report, context);
     if let Some(expected) = &context.expected_result {
         prompt.push_str("\n\nExpected verification result:\n");
         prompt.push_str(expected);
@@ -212,6 +213,7 @@ Make the smallest bounded change, then stop.",
         prompt.push_str("\n\n");
         prompt.push_str(&contract_attribute_guidance);
     }
+    append_profile_repair_guidance(&mut prompt, report, context);
     if let Some(expected) = &context.expected_result {
         prompt.push_str("\n\nExpected verification result:\n");
         prompt.push_str(expected);
@@ -240,6 +242,21 @@ Make the smallest bounded change, then stop.",
     prompt.push_str("\n\n");
     prompt.push_str(&repair_rules_prefix());
     prompt
+}
+
+fn append_profile_repair_guidance(
+    prompt: &mut String,
+    report: &VerificationReport,
+    context: &RepairContext,
+) {
+    let Some(guidance) = crate::planner::profiles::data::repair_policy::profile_guidance(
+        context.profile.as_deref(),
+        report,
+    ) else {
+        return;
+    };
+    prompt.push_str("\n\nProfile repair guidance:\n");
+    prompt.push_str(&guidance);
 }
 
 pub fn build_compact_compile_repair_prompt_with_context(

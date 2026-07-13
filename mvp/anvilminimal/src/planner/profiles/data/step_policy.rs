@@ -63,8 +63,8 @@ pub(crate) fn run_step_catalog_checks(
         let Some(execution) = execute_catalog_check(root, command) else {
             continue;
         };
-        if !profile
-            .is_some_and(|profile| crate::planner::profile::domain_profile(profile).id() == "data")
+        if profile
+            .is_none_or(|profile| crate::planner::profile::domain_profile(profile).id() != "data")
         {
             report.push_command_failure(
                 command.clone(),

@@ -1,0 +1,50 @@
+case_id = "test0714_data_manifest_canonicalization"
+source = "uat-test0713-data-001 runs 1, 2, and 4 canonicalization regressions"
+required_paths = []
+verify_commands = []
+required_capabilities = []
+required_evidence = []
+required_obligations = []
+deferred_verify_requirements = []
+evidence_hint_tokens = ["data", "inspection", "results-schema", "dependency-denial"]
+
+[route_closure]
+include = []
+exclude = []
+
+[weak_evidence]
+contains = []
+
+[diagnostics]
+contains = []
+
+[compile]
+expect = "not_checked"
+
+[fixture_contains]
+fixtures/run1-inspection-literal-grep.jsonl = [
+  "uat-test0713-data-001/run-1",
+  "\"event\":\"verify_canonicalized\"",
+  "\"original\":\"data/inspection_report.md\"",
+  "\"replacement\":\"output/inspection.json\"",
+  "grep -q 'Rows inspected' data/inspection_report.md",
+  "\"replacement\":\"advisory\"",
+  "\"event\":\"preset_step_converted\""
+]
+fixtures/run2-invented-schema-check.jsonl = [
+  "uat-test0713-data-001/run-2",
+  "python3 tests/verify_pipeline.py",
+  "anvil-catalog-check:data_results_schema",
+  "anvil-catalog-check:data_reconciliation",
+  "\"event\":\"verify_canonicalized\""
+]
+fixtures/run4-instruction-schema.jsonl = [
+  "uat-test0713-data-001/run-4",
+  "excluded_rows",
+  "\\\"reconciliation\\\"",
+  "\\\"values\\\"",
+  "anvil-catalog-check:data_results_schema",
+  "\"event\":\"dependency_denial_guidance\"",
+  "Python 3 standard library only (csv/json/statistics)",
+  "\"repair_exhausted\":false"
+]

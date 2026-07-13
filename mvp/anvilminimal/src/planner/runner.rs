@@ -44,8 +44,7 @@ use crate::minimal_loop::loop_run::{
     RunStopReason, extract_requested_artifact_paths, run_session_with_outcome_with_options,
 };
 use crate::minimal_loop::reachability::{
-    RepairReachability, assess_repair_reachability, reachability_failure_kind,
-    reachability_recovery_reason,
+    RepairReachability, reachability_failure_kind, reachability_recovery_reason,
 };
 use crate::minimal_loop::repair_pressure::CarriedPressure;
 use crate::minimal_loop::repair_target::{
@@ -2243,8 +2242,14 @@ fn run_step(
         return Ok(outcome);
     }
     let first_target = classify_repair_target(&report).as_str().to_string();
+    let repair_policy = crate::planner::profiles::data::repair_policy::StepRepairPolicy::new(
+        &config.profile,
+        &step.id,
+        STEP_REPAIR_MAX_TURNS,
+        config.eval_events_path.as_deref(),
+    );
     let mut current_reachability =
-        assess_repair_reachability(&report, None, setup_authority, config.offline);
+        repair_policy.assess(&report, setup_authority, config.offline, 0);
     outcome.primary_failure = Some(report.primary_reason());
     outcome.verify_failures.push(report.primary_reason());
     outcome.repair_targets.push(first_target.clone());
@@ -2498,7 +2503,7 @@ fn run_step(
             }
             let retry_target = classify_repair_target(&retry);
             let retry_reachability =
-                assess_repair_reachability(&retry, None, setup_authority, config.offline);
+                repair_policy.assess(&retry, setup_authority, config.offline, attempt);
             let previous_target = classify_repair_target(&current_report);
             let repair_follow_through =
                 classify_repair_follow_through(previous_target, &repair_turn_changed_paths);
@@ -2653,11 +2658,11 @@ fn run_step(
                             outcome.stop_reason = Some("hook_snapshot_restore_applied".to_string());
                             return Ok(outcome);
                         }
-                        let restored_reachability = assess_repair_reachability(
+                        let restored_reachability = repair_policy.assess(
                             &restored_retry,
-                            None,
                             setup_authority,
                             config.offline,
+                            attempt,
                         );
                         if !restored_reachability.reachable {
                             terminal_repair_failure_kind =
@@ -2850,11 +2855,11 @@ fn run_step(
                                     Some("compile_regeneration_applied".to_string());
                                 return Ok(outcome);
                             }
-                            let regenerated_reachability = assess_repair_reachability(
+                            let regenerated_reachability = repair_policy.assess(
                                 &regenerated_report,
-                                None,
                                 setup_authority,
                                 config.offline,
+                                attempt,
                             );
                             if !regenerated_reachability.reachable {
                                 terminal_repair_failure_kind = Some(

@@ -1,0 +1,3 @@
+{"case":"uat-test0713-data-001/run-1","event":"verify_canonicalized","step_id":"inspect-data","field":"expected_path","original":"data/inspection_report.md","replacement":"output/inspection.json","disposition":"canonical"}
+{"case":"uat-test0713-data-001/run-1","event":"verify_canonicalized","step_id":"inspect-data","field":"verify","original":"grep -q 'Rows inspected' data/inspection_report.md","replacement":"advisory","disposition":"advisory"}
+{"case":"uat-test0713-data-001/run-1","event":"preset_step_converted","phase_id":"data-inspection","step_id":"inspect-data","ownership":"data_manifest_artifact"}
