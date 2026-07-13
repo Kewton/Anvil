@@ -108,6 +108,8 @@ declared complete while a row remains `open`.
 | --- | --- | --- | --- | --- | --- |
 | _None before B-2_ | — | — | — | — | — |
 
+B-2 の data プロファイル実装は docs/data-profile-contract.md（fixed）に適合しなければならない。契約との不整合はスキーマ側でなく実装側の問題として扱う。
+
 ## Promotion boundary
 
 `draft` and `admitted` are the only v0 status values. This task only reserves
