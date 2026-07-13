@@ -1151,8 +1151,12 @@ pub fn run_ultra_plan_with_ui(
                     let repair_targets =
                         final_acceptance_recovery_repair_targets(&acceptance_report, repair_target);
                     let missing_signals = verification_missing_signals(&acceptance_report);
-                    let failure_evidence =
-                        final_acceptance_recovery_failure_evidence(&acceptance_report, &err_text);
+                    let failure_evidence = final_acceptance_recovery_failure_evidence(
+                        &plan.profile,
+                        &plan.goal,
+                        &acceptance_report,
+                        &err_text,
+                    );
                     let handoff = save_ultra_phase_recovery_handoff_with_evidence(
                         config,
                         plan,
@@ -1500,6 +1504,8 @@ pub fn run_ultra_plan_with_ui(
                     .unwrap_or_else(|| "final_acceptance_repair_exhausted".to_string())
             };
             let handoff_reason = final_acceptance_recovery_reason(
+                &plan.profile,
+                &plan.goal,
                 &acceptance_report,
                 &reason,
                 &exhausted_reason_for_event,
@@ -1509,6 +1515,7 @@ pub fn run_ultra_plan_with_ui(
             let failure_evidence = final_acceptance_recovery_failure_evidence_with_context(
                 &config.workspace_root,
                 &plan.profile,
+                &plan.goal,
                 &acceptance_report,
                 &handoff_reason,
             );

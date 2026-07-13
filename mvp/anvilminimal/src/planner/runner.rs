@@ -136,9 +136,6 @@ const DEV_SERVER_LOG_EXCERPT_BYTES: usize = 24_000;
 const DEV_SERVER_ROUTE: &str = "/";
 const DEV_SERVER_LIFECYCLE_STAGES: [&str; 4] = ["start", "wait", "probe", "cleanup"];
 const PROFILE_REPAIR_FILE_EXCERPT_MAX_CHARS: usize = 2_400;
-const INTERACTION_STATE_CHANGE_REPAIR_REQUIREMENT: &str = "keyboard or pointer input must visibly change game state (player position, projectiles, score/health, or state transitions); wire input handlers into the render/update loop.";
-const INTERACTION_START_REPAIR_REQUIREMENT: &str = "primary/start controls must transition the visible app state before input is evaluated; wire the start action into state and render updates.";
-const PERSISTENCE_RELOAD_REPAIR_REQUIREMENT: &str = "load persisted state on mount (e.g. read localStorage in initialization) and write on mutation";
 const TEXT_ECHO_REPAIR_REQUIREMENT: &str = "token never rendered; render the input's content reactively (no manual rebuild) - the typed text must appear in the preview/list";
 const TEXT_ECHO_AFTER_RELOAD_REPAIR_REQUIREMENT: &str =
     "preview renders only after reload - make it reactive to input";
@@ -3712,6 +3709,8 @@ fn verify_plan_final_contract(
             acceptance_layer,
             &failure_kind,
             release_recovery_failure_evidence(
+                &config.profile,
+                &plan.goal,
                 &release_gate,
                 final_acceptance_status,
                 &primary_reason,
@@ -5642,6 +5641,8 @@ fn weak_source_evidence_covered_by_runtime(
 }
 
 fn runtime_acceptance_repair_guidance(
+    profile: &str,
+    goal: &str,
     acceptance: &crate::minimal_loop::evidence::RuntimeAcceptanceReport,
 ) -> Vec<String> {
     let mut guidance = Vec::new();
@@ -5653,7 +5654,13 @@ fn runtime_acceptance_repair_guidance(
                 ));
             }
             "persistence_evidence" => {
-                guidance.push(PERSISTENCE_RELOAD_REPAIR_REQUIREMENT.to_string())
+                guidance.extend(
+                    crate::planner::profile::inferred_profile_interaction_repair_guidance(
+                        profile,
+                        goal,
+                        "browser_interaction_failed:persistence_after_reload_reset",
+                    ),
+                );
             }
             "live_preview_evidence" | "requested_content_evidence" => {
                 guidance.push(TEXT_ECHO_REPAIR_REQUIREMENT.to_string())
@@ -7097,6 +7104,8 @@ fn app_behavior_probe_failure_kind(reason: &str) -> Option<String> {
 }
 
 fn release_recovery_failure_evidence(
+    profile: &str,
+    goal: &str,
     release_gate: &ReleaseGateSummary,
     final_acceptance_status: &str,
     primary_reason: &str,
@@ -7161,6 +7170,8 @@ fn release_recovery_failure_evidence(
             release_gate.interaction_evidence_path
         ));
         evidence.extend(interaction_probe_failure_evidence_lines(
+            profile,
+            goal,
             &release_gate.interaction_evidence_path,
         ));
     }
@@ -7172,7 +7183,7 @@ fn release_recovery_failure_evidence(
                 .map(|item| format!("missing runtime evidence: {item}")),
         );
         evidence.extend(
-            runtime_acceptance_repair_guidance(report)
+            runtime_acceptance_repair_guidance(profile, goal, report)
                 .into_iter()
                 .map(|item| format!("runtime repair guidance: {item}")),
         );
@@ -7198,7 +7209,7 @@ fn release_recovery_failure_evidence(
     dedup_strings(evidence)
 }
 
-fn interaction_probe_failure_evidence_lines(path: &str) -> Vec<String> {
+fn interaction_probe_failure_evidence_lines(profile: &str, goal: &str, path: &str) -> Vec<String> {
     let Some(value) = std::fs::read_to_string(path)
         .ok()
         .and_then(|text| serde_json::from_str::<Value>(&text).ok())
@@ -7211,6 +7222,8 @@ fn interaction_probe_failure_evidence_lines(path: &str) -> Vec<String> {
         .map(|kind| format!("browser_interaction_failed:{kind}"))
         .unwrap_or_default();
     lines.extend(interaction_root_cause_repair_guidance(
+        profile,
+        goal,
         &failure_kind,
         Some(&value),
     ));
@@ -12978,7 +12991,8 @@ export default function Page() {
         )
         .unwrap();
 
-        let lines = interaction_probe_failure_evidence_lines(&path.display().to_string());
+        let lines =
+            interaction_probe_failure_evidence_lines("generic", "", &path.display().to_string());
 
         assert!(
             lines.iter().any(|line| {
@@ -13063,25 +13077,30 @@ export default function Page() {
             .map(|diagnostic| diagnostic.guidance)
             .expect("unattached ref guidance");
         let attach_at = prompt.find(&attach).unwrap_or_else(|| panic!("{prompt}"));
+        let repair_guidance = &crate::planner::profiles::nextjs::knowledge::get().repair_guidance;
         let render_at = prompt
-            .find("render-loop checklist: ref attached -> effect runs -> rAF loop starts -> draw calls")
+            .find(&repair_guidance.canvas_render_loop_checklist)
             .unwrap_or_else(|| panic!("{prompt}"));
         let input_at = prompt
-            .find("input-wiring checklist:")
+            .find(&repair_guidance.canvas_input_wiring_checklist)
             .unwrap_or_else(|| panic!("{prompt}"));
         assert!(attach_at < render_at && render_at < input_at, "{prompt}");
         let failure_kind = final_acceptance_app_behavior_failure_kind(&report).unwrap();
-        let recovery_evidence = final_acceptance_recovery_failure_evidence(&report, &failure_kind);
+        let recovery_evidence = final_acceptance_recovery_failure_evidence(
+            &plan.profile,
+            &plan.goal,
+            &report,
+            &failure_kind,
+        );
         assert_eq!(
             recovery_evidence.first().map(String::as_str),
             Some(attach.as_str()),
             "{recovery_evidence:?}"
         );
-        assert_eq!(
-            recovery_evidence.get(1).map(String::as_str),
-            Some(
-                "render-loop checklist: ref attached -> effect runs -> rAF loop starts -> draw calls"
-            ),
+        assert!(
+            recovery_evidence
+                .iter()
+                .any(|line| line == &repair_guidance.canvas_render_loop_checklist),
             "{recovery_evidence:?}"
         );
 
@@ -13199,7 +13218,7 @@ export default function Page() {
             )
         );
         assert!(repair_prompt.contains("player=20 score=0 health=3"));
-        assert!(repair_prompt.contains(INTERACTION_STATE_CHANGE_REPAIR_REQUIREMENT));
+        assert!(repair_prompt.contains(canvas_game_repair_guidance()));
         assert!(repair_prompt.contains("Route-bound implementation targets:"));
         assert!(repair_prompt.contains("src/app/page.tsx"));
     }
@@ -13290,7 +13309,7 @@ export default function Page() {
             "{recovery_text}"
         );
         assert!(
-            recovery_text.contains(INTERACTION_STATE_CHANGE_REPAIR_REQUIREMENT),
+            recovery_text.contains(canvas_game_repair_guidance()),
             "{recovery_text}"
         );
         assert!(!recovery_text.contains("/setup-interaction-probe"));
@@ -13353,7 +13372,7 @@ export default function Page() {
             )
         );
         assert!(repair_prompt.contains("player=20 score=0 health=3"));
-        assert!(repair_prompt.contains(INTERACTION_STATE_CHANGE_REPAIR_REQUIREMENT));
+        assert!(repair_prompt.contains(canvas_game_repair_guidance()));
         assert!(
             repair_prompt.contains("probe mode: heuristic"),
             "{repair_prompt}"
@@ -13468,8 +13487,13 @@ export default function Page() {
             failure_kind,
             "browser_interaction_failed:input_state_change_missing_after_start"
         );
-        let reason =
-            final_acceptance_recovery_reason(&report, &failure_kind, "bounded_repair_exhausted");
+        let reason = final_acceptance_recovery_reason(
+            &plan.profile,
+            &plan.goal,
+            &report,
+            &failure_kind,
+            "bounded_repair_exhausted",
+        );
         let targets =
             final_acceptance_recovery_repair_targets(&report, classify_repair_target(&report));
         assert_eq!(targets, vec!["input_state_render_wiring".to_string()]);
@@ -13495,7 +13519,7 @@ export default function Page() {
             "{recovery_text}"
         );
         assert!(
-            recovery_text.contains(INTERACTION_STATE_CHANGE_REPAIR_REQUIREMENT),
+            recovery_text.contains(canvas_game_repair_guidance()),
             "{recovery_text}"
         );
         assert!(!recovery_text.contains("/setup-interaction-probe"));
@@ -13893,7 +13917,8 @@ export default function Page() {
             ..RuntimeAcceptanceReport::default()
         };
 
-        let guidance = runtime_acceptance_repair_guidance(&report).join("\n");
+        let guidance =
+            runtime_acceptance_repair_guidance("nextjs", "Space Invaders game", &report).join("\n");
 
         assert!(
             guidance.contains("src/components/SpaceInvaders.tsx"),
@@ -13919,7 +13944,8 @@ export default function Page() {
             ..RuntimeAcceptanceReport::default()
         };
 
-        let guidance = runtime_acceptance_repair_guidance(&report).join("\n");
+        let guidance =
+            runtime_acceptance_repair_guidance("nextjs", "Space Invaders game", &report).join("\n");
 
         assert!(
             guidance.contains(RESTART_PARTIAL_REPAIR_GUIDANCE),
@@ -13934,7 +13960,9 @@ export default function Page() {
             ..RuntimeAcceptanceReport::default()
         };
 
-        let guidance = runtime_acceptance_repair_guidance(&report).join("\n");
+        let guidance =
+            runtime_acceptance_repair_guidance("nextjs", "Create a persistent notes app", &report)
+                .join("\n");
 
         assert!(
             guidance.contains("load persisted state on mount"),
@@ -13954,7 +13982,8 @@ export default function Page() {
             ..RuntimeAcceptanceReport::default()
         };
 
-        let guidance = runtime_acceptance_repair_guidance(&report).join("\n");
+        let guidance =
+            runtime_acceptance_repair_guidance("nextjs", "Create a notes app", &report).join("\n");
 
         assert!(
             guidance.contains("render the input's content reactively"),
@@ -13974,8 +14003,13 @@ export default function Page() {
             "browser_interaction_failed:token_echo_after_reload_only".to_string(),
         );
 
-        let guidance =
-            final_acceptance_recovery_reason(&report, "acceptance failed", "repair exhausted");
+        let guidance = final_acceptance_recovery_reason(
+            "nextjs",
+            "Create a notes app",
+            &report,
+            "acceptance failed",
+            "repair exhausted",
+        );
 
         assert!(
             guidance.contains("preview renders only after reload"),
@@ -15356,6 +15390,12 @@ export default function Memo(){
 
     fn nextjs_complete_package_json() -> &'static str {
         r#"{"dependencies":{"next":"^14.2.0","react":"^18.3.0","react-dom":"^18.3.0"},"devDependencies":{"typescript":"^5.5.0","@types/node":"^20.14.0","@types/react":"^18.3.0","@types/react-dom":"^18.3.0","tailwindcss":"^3.4.19","postcss":"^8.5.15","autoprefixer":"^10.4.20"},"scripts":{"build":"next build","dev":"next dev -p 3011","start":"next start -p 3011"}}"#
+    }
+
+    fn canvas_game_repair_guidance() -> &'static str {
+        &crate::planner::profiles::nextjs::knowledge::get()
+            .repair_guidance
+            .canvas_game_interaction
     }
 
     fn nextjs_lean_package_json() -> &'static str {
@@ -17681,8 +17721,12 @@ exit 2\n",
             targets.first().map(String::as_str),
             Some("fix_compile_error")
         );
-        let evidence =
-            final_acceptance_recovery_failure_evidence(&report, "compile_repair_no_source_change");
+        let evidence = final_acceptance_recovery_failure_evidence(
+            "generic",
+            "",
+            &report,
+            "compile_repair_no_source_change",
+        );
         assert!(
             evidence
                 .first()

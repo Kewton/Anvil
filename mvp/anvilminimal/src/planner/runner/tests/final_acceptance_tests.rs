@@ -245,17 +245,11 @@ mod moved {
         std::fs::write(
             src.join("page.tsx"),
             r#"
-import { useEffect, useRef } from "react";
-export default function Game() {
-  const gameRef = useRef({ score: 0 });
-  useEffect(() => {
-    const tick = () => {
-      gameRef.current.score += 1;
-      requestAnimationFrame(tick);
-    };
-    requestAnimationFrame(tick);
-  }, []);
-  return <main><button>Start</button><output data-anvil-state={JSON.stringify({ score: gameRef.current.score })} /></main>;
+import { useRef } from "react";
+export default function Quiz() {
+  const quizRef = useRef({ score: 0 });
+  const answer = () => { quizRef.current.score += 1; };
+  return <main><button onClick={answer}>Answer</button><output data-anvil-state={JSON.stringify({ score: quizRef.current.score })} /></main>;
 }
 "#,
         )
@@ -275,7 +269,8 @@ export default function Game() {
             interaction.display()
         ));
         let plan = UltraPlan {
-            goal: "Create an interactive browser game".to_string(),
+            goal: "Create a Next.js quiz app with answer buttons, score, and retry behavior"
+                .to_string(),
             profile: "nextjs".to_string(),
             style: "default".to_string(),
             intent: "create".to_string(),
@@ -345,6 +340,16 @@ export default function Game() {
         );
         assert!(prompt.contains("src/app/page.tsx"), "{prompt}");
         assert!(prompt.contains("near line"), "{prompt}");
+        assert!(
+            prompt.contains(
+                &crate::planner::profiles::nextjs::knowledge::get()
+                    .repair_guidance
+                    .generic_interaction
+            ),
+            "{prompt}"
+        );
+        assert!(!prompt.contains("projectiles"), "{prompt}");
+        assert!(!prompt.contains("rAF loop"), "{prompt}");
         assert!(
             prompt.contains(
                 &crate::planner::profiles::nextjs::knowledge::get()

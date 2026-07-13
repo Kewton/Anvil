@@ -85,6 +85,12 @@ pub struct ProfileDeterministicStepPlan {
     pub plan: StepPlan,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InteractionRepairContract {
+    pub required_capabilities: Vec<String>,
+    pub required_evidence: Vec<String>,
+}
+
 pub trait DomainProfile: Sync {
     fn id(&self) -> &'static str;
 
@@ -165,6 +171,14 @@ pub trait DomainProfile: Sync {
         _report: &VerificationReport,
     ) -> Option<String> {
         None
+    }
+
+    fn interaction_repair_guidance(
+        &self,
+        _failure_kind: &str,
+        _contract: &InteractionRepairContract,
+    ) -> Vec<String> {
+        Vec::new()
     }
 
     fn deterministic_repair(
@@ -438,6 +452,18 @@ impl DomainProfile for NextjsProfile {
         ))
     }
 
+    fn interaction_repair_guidance(
+        &self,
+        failure_kind: &str,
+        contract: &InteractionRepairContract,
+    ) -> Vec<String> {
+        crate::planner::profiles::nextjs::knowledge::interaction_repair_guidance(
+            failure_kind,
+            &contract.required_capabilities,
+            &contract.required_evidence,
+        )
+    }
+
     fn deterministic_repair(
         &self,
         root: &Path,
@@ -662,6 +688,16 @@ impl DomainProfile for GenericProfile {
             ),
             _ => None,
         }
+    }
+
+    fn interaction_repair_guidance(
+        &self,
+        failure_kind: &str,
+        _contract: &InteractionRepairContract,
+    ) -> Vec<String> {
+        crate::planner::profiles::nextjs::knowledge::generic_interaction_repair_guidance(
+            failure_kind,
+        )
     }
 
     fn build_oracle(&self, command: &str) -> Option<ProfileBuildOracle> {
@@ -989,6 +1025,39 @@ pub fn profile_repair_prompt(
     domain_profile(profile).repair_prompt(root, goal, report)
 }
 
+pub fn interaction_repair_contract(profile: &str, goal: &str) -> InteractionRepairContract {
+    let profile = domain_profile(profile);
+    let required_capabilities = profile.infer_required_capabilities(goal);
+    let mut required_evidence = profile.infer_required_evidence(goal, &required_capabilities);
+    for capability in &required_capabilities {
+        merge_unique_strings(
+            &mut required_evidence,
+            &required_evidence_for_capability(capability),
+        );
+    }
+    InteractionRepairContract {
+        required_capabilities,
+        required_evidence,
+    }
+}
+
+pub fn profile_interaction_repair_guidance(
+    profile: &str,
+    failure_kind: &str,
+    contract: &InteractionRepairContract,
+) -> Vec<String> {
+    domain_profile(profile).interaction_repair_guidance(failure_kind, contract)
+}
+
+pub fn inferred_profile_interaction_repair_guidance(
+    profile: &str,
+    goal: &str,
+    failure_kind: &str,
+) -> Vec<String> {
+    let contract = interaction_repair_contract(profile, goal);
+    profile_interaction_repair_guidance(profile, failure_kind, &contract)
+}
+
 pub fn profile_auto_repair(
     root: &Path,
     profile: &str,
@@ -1061,5 +1130,93 @@ fn merge_unique_strings(out: &mut Vec<String>, incoming: &[String]) {
         if !out.contains(item) {
             out.push(item.clone());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const FAILURE: &str = "browser_interaction_failed:input_state_change_missing_after_start";
+
+    #[test]
+    fn quiz_contract_uses_generic_interaction_guidance_only() {
+        let contract = interaction_repair_contract(
+            "nextjs",
+            "Create a Next.js quiz app with answer buttons, score, and retry behavior",
+        );
+
+        let guidance = profile_interaction_repair_guidance("nextjs", FAILURE, &contract);
+
+        assert_eq!(
+            guidance,
+            vec![
+                crate::planner::profiles::nextjs::knowledge::get()
+                    .repair_guidance
+                    .generic_interaction
+                    .clone()
+            ]
+        );
+        assert!(guidance.iter().all(|line| !line.contains("projectiles")));
+        assert!(guidance.iter().all(|line| !line.contains("rAF loop")));
+    }
+
+    #[test]
+    fn space_contract_keeps_canvas_game_guidance() {
+        let contract = interaction_repair_contract(
+            "nextjs",
+            "Create a playable Space Invaders game with enemies, collision, and lives",
+        );
+
+        let guidance = profile_interaction_repair_guidance("nextjs", FAILURE, &contract);
+
+        let knowledge = &crate::planner::profiles::nextjs::knowledge::get().repair_guidance;
+        for expected in [
+            &knowledge.generic_interaction,
+            &knowledge.canvas_game_interaction,
+            &knowledge.canvas_render_loop_checklist,
+            &knowledge.canvas_input_wiring_checklist,
+        ] {
+            assert!(guidance.contains(expected), "{guidance:?}");
+        }
+    }
+
+    #[test]
+    fn persistence_guidance_requires_persistence_evidence() {
+        let ordinary = interaction_repair_contract("nextjs", "Create an interactive form app");
+        let persistent = interaction_repair_contract(
+            "nextjs",
+            "Create a notes app saved in localStorage with live preview",
+        );
+        let persistence = &crate::planner::profiles::nextjs::knowledge::get()
+            .repair_guidance
+            .persistence;
+
+        assert!(
+            !profile_interaction_repair_guidance("nextjs", FAILURE, &ordinary)
+                .contains(persistence)
+        );
+        assert!(
+            profile_interaction_repair_guidance("nextjs", FAILURE, &persistent)
+                .contains(persistence)
+        );
+    }
+
+    #[test]
+    fn generic_profile_never_adds_canvas_game_guidance() {
+        let contract = InteractionRepairContract {
+            required_capabilities: vec!["adversary_or_challenge".to_string()],
+            required_evidence: vec!["failure_or_collision_evidence".to_string()],
+        };
+
+        let guidance = profile_interaction_repair_guidance("generic", FAILURE, &contract);
+
+        assert_eq!(guidance.len(), 1);
+        assert_eq!(
+            guidance[0],
+            crate::planner::profiles::nextjs::knowledge::get()
+                .repair_guidance
+                .generic_interaction
+        );
     }
 }

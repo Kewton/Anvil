@@ -509,9 +509,15 @@ if __name__ == "__main__":
             gate.interaction_evidence_status,
             "not_exercised:build_verifier_failed"
         );
-        let evidence =
-            release_recovery_failure_evidence(&gate, "failed", "release gate failed", None)
-                .join("\n");
+        let evidence = release_recovery_failure_evidence(
+            "nextjs",
+            "Create a browser app",
+            &gate,
+            "failed",
+            "release gate failed",
+            None,
+        )
+        .join("\n");
         assert!(evidence.contains("interaction evidence: not_exercised:build_verifier_failed"));
         assert!(!evidence.contains("probe_unavailable"), "{evidence}");
         assert!(

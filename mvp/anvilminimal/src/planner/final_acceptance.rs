@@ -874,6 +874,8 @@ pub(super) fn ultra_final_acceptance_report_inner(
             acceptance_layer,
             &failure_kind,
             release_recovery_failure_evidence(
+                &effective_profile,
+                &plan.goal,
                 &release_gate,
                 final_acceptance_status,
                 &primary_reason,
@@ -1016,7 +1018,9 @@ pub(super) fn ultra_final_acceptance_report_inner(
     merge_verification_report(&mut report, profile_report);
     if !acceptance.passed {
         report.push_profile_failure(acceptance.primary_reason.clone());
-        for guidance in runtime_acceptance_repair_guidance(&acceptance) {
+        for guidance in
+            runtime_acceptance_repair_guidance(&effective_profile, &plan.goal, &acceptance)
+        {
             report.push_profile_failure(format!("repair guidance: {guidance}"));
         }
         for target in &acceptance.obligation_repair_targets {
@@ -1873,8 +1877,12 @@ pub(super) fn final_acceptance_repair_prompt_stable(
     let profile_failures = render_prompt_bullets(&profile_failures);
     let adherence_guidance =
         final_acceptance_adherence_guidance(report, repair_target, adherence_missing);
-    let behavioral_probe_context =
-        final_acceptance_behavioral_probe_context(report, expected_paths);
+    let behavioral_probe_context = final_acceptance_behavioral_probe_context(
+        &plan.profile,
+        &plan.goal,
+        report,
+        expected_paths,
+    );
     let restart_attachment_guidance =
         final_acceptance_restart_attachment_guidance(root, plan, report);
     let pending_evidence_guidance =
@@ -1979,8 +1987,12 @@ pub(super) fn final_acceptance_repair_prompt_legacy(
     let profile_failures = render_prompt_bullets(&profile_failures);
     let adherence_guidance =
         final_acceptance_adherence_guidance(report, repair_target, adherence_missing);
-    let behavioral_probe_context =
-        final_acceptance_behavioral_probe_context(report, expected_paths);
+    let behavioral_probe_context = final_acceptance_behavioral_probe_context(
+        &plan.profile,
+        &plan.goal,
+        report,
+        expected_paths,
+    );
     let restart_attachment_guidance =
         final_acceptance_restart_attachment_guidance(root, plan, report);
     let pending_evidence_guidance =
@@ -2084,74 +2096,17 @@ pub(super) fn final_acceptance_restart_attachment_guidance(
 }
 
 pub(super) fn interaction_root_cause_repair_guidance(
+    profile: &str,
+    goal: &str,
     failure_kind: &str,
     evidence: Option<&Value>,
 ) -> Vec<String> {
-    if !interaction_render_loop_failure(failure_kind) {
-        return Vec::new();
-    }
-    let mut lines = evidence
-        .map(unattached_ref_guidance_lines)
-        .unwrap_or_default();
-    lines.push(
-        "render-loop checklist: ref attached -> effect runs -> rAF loop starts -> draw calls"
-            .to_string(),
-    );
-    lines.push(format!(
-        "input-wiring checklist: {INTERACTION_STATE_CHANGE_REPAIR_REQUIREMENT}"
-    ));
-    dedup_strings(lines)
-}
-
-pub(super) fn interaction_render_loop_failure(failure_kind: &str) -> bool {
-    let lower = failure_kind.to_ascii_lowercase();
-    lower.contains("input_state_change_missing_after_start") || lower.contains("canvas_blank")
-}
-
-pub(super) fn unattached_ref_guidance_lines(value: &Value) -> Vec<String> {
-    raw_value_scopes(value)
-        .into_iter()
-        .find_map(|scope| {
-            scope
-                .get("unattached_ref_diagnostics")
-                .and_then(Value::as_array)
-                .map(|items| {
-                    items
-                        .iter()
-                        .filter_map(unattached_ref_guidance_line)
-                        .collect::<Vec<_>>()
-                })
-                .filter(|items| !items.is_empty())
-        })
-        .unwrap_or_default()
-}
-
-pub(super) fn unattached_ref_guidance_line(value: &Value) -> Option<String> {
-    if let Some(guidance) = value
-        .get("guidance")
-        .and_then(Value::as_str)
-        .filter(|guidance| !guidance.trim().is_empty())
-    {
-        return Some(guidance.trim().to_string());
-    }
-    let name = value.get("name").and_then(Value::as_str)?;
-    let candidate = value
-        .get("candidate_elements")
-        .and_then(Value::as_array)?
-        .first()?;
-    let tag = candidate.get("tag").and_then(Value::as_str)?;
-    let source = candidate.get("source").and_then(Value::as_str)?;
-    let line = candidate.get("line").and_then(Value::as_u64)?;
-    let file = Path::new(source)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(source);
-    Some(format!(
-        "attach ref={{{name}}} to the <{tag}> at {file}:{line}"
-    ))
+    crate::planner::interaction_repair::inferred_guidance(profile, goal, failure_kind, evidence)
 }
 
 pub(super) fn final_acceptance_behavioral_probe_context(
+    profile: &str,
+    goal: &str,
     report: &VerificationReport,
     expected_paths: &[String],
 ) -> String {
@@ -2171,7 +2126,8 @@ pub(super) fn final_acceptance_behavioral_probe_context(
                 "canvas/center click".to_string(),
             ]
         });
-    let mut lines = interaction_root_cause_repair_guidance(&failure_kind, evidence.as_ref());
+    let mut lines =
+        interaction_root_cause_repair_guidance(profile, goal, &failure_kind, evidence.as_ref());
     lines.extend([
         "Interaction probe context:".to_string(),
         format!("- failure kind: {failure_kind}"),
@@ -2293,25 +2249,6 @@ pub(super) fn final_acceptance_behavioral_probe_context(
             }
         }
     }
-    if failure_kind.contains("start_transition_missing") {
-        lines.push(format!(
-            "- concrete requirement: {INTERACTION_START_REPAIR_REQUIREMENT}"
-        ));
-    }
-    if failure_kind.contains("interaction_state_change_missing")
-        || failure_kind.contains("input_state_change_missing_after_start")
-        || failure_kind.contains("input_state_change_not_evaluated_after_start")
-        || failure_kind.contains("text_input_state_change_missing")
-    {
-        lines.push(format!(
-            "- concrete requirement: {INTERACTION_STATE_CHANGE_REPAIR_REQUIREMENT}"
-        ));
-    }
-    if failure_kind.contains("persistence_after_reload_reset") {
-        lines.push(format!(
-            "- concrete requirement: {PERSISTENCE_RELOAD_REPAIR_REQUIREMENT}"
-        ));
-    }
     if failure_kind.contains("token_echo_after_reload_only") {
         lines.push(format!(
             "- concrete requirement: {TEXT_ECHO_AFTER_RELOAD_REPAIR_REQUIREMENT}"
@@ -2332,17 +2269,7 @@ pub(super) fn final_acceptance_behavioral_probe_context(
 pub(super) fn final_acceptance_concrete_interaction_requirement(
     failure_kind: &str,
 ) -> Option<&'static str> {
-    if failure_kind.contains("interaction_state_change_missing")
-        || failure_kind.contains("input_state_change_missing_after_start")
-        || failure_kind.contains("input_state_change_not_evaluated_after_start")
-        || failure_kind.contains("text_input_state_change_missing")
-    {
-        Some(INTERACTION_STATE_CHANGE_REPAIR_REQUIREMENT)
-    } else if failure_kind.contains("start_transition_missing") {
-        Some(INTERACTION_START_REPAIR_REQUIREMENT)
-    } else if failure_kind.contains("persistence_after_reload_reset") {
-        Some(PERSISTENCE_RELOAD_REPAIR_REQUIREMENT)
-    } else if failure_kind.contains("token_echo_after_reload_only") {
+    if failure_kind.contains("token_echo_after_reload_only") {
         Some(TEXT_ECHO_AFTER_RELOAD_REPAIR_REQUIREMENT)
     } else if failure_kind.contains("token_echo_missing") {
         Some(TEXT_ECHO_REPAIR_REQUIREMENT)
@@ -2352,6 +2279,8 @@ pub(super) fn final_acceptance_concrete_interaction_requirement(
 }
 
 pub(super) fn final_acceptance_recovery_reason(
+    profile: &str,
+    goal: &str,
     report: &VerificationReport,
     reason: &str,
     exhausted_reason: &str,
@@ -2368,6 +2297,12 @@ pub(super) fn final_acceptance_recovery_reason(
             out.push_str("; behavioral probe reason: ");
             out.push_str(&failure_kind);
             if let Some(requirement) =
+                interaction_root_cause_repair_guidance(profile, goal, &failure_kind, None).first()
+            {
+                out.push_str("\nconcrete requirement: ");
+                out.push_str(requirement);
+            }
+            if let Some(requirement) =
                 final_acceptance_concrete_interaction_requirement(&failure_kind)
             {
                 out.push_str("\nconcrete requirement: ");
@@ -2378,7 +2313,7 @@ pub(super) fn final_acceptance_recovery_reason(
             out.push_str("\nremedy: ");
             out.push_str(&remedy);
         }
-        let context = final_acceptance_behavioral_probe_context(report, &[]);
+        let context = final_acceptance_behavioral_probe_context(profile, goal, report, &[]);
         if !context.is_empty() {
             out.push('\n');
             out.push_str(context.trim());
@@ -2392,27 +2327,20 @@ pub(super) fn final_acceptance_recovery_reason(
     let mut out = format!(
         "{failure_kind}; final acceptance repair stopped: {exhausted_reason}; repair target: {repair_targets}"
     );
-    if failure_kind.contains("interaction_state_change_missing")
-        || failure_kind.contains("input_state_change_missing_after_start")
-        || failure_kind.contains("input_state_change_not_evaluated_after_start")
-        || failure_kind.contains("text_input_state_change_missing")
+    if let Some(requirement) =
+        interaction_root_cause_repair_guidance(profile, goal, &failure_kind, None).first()
     {
         out.push_str("; ");
-        out.push_str(INTERACTION_STATE_CHANGE_REPAIR_REQUIREMENT);
-    } else if failure_kind.contains("start_transition_missing") {
-        out.push_str("; ");
-        out.push_str(INTERACTION_START_REPAIR_REQUIREMENT);
-    } else if failure_kind.contains("persistence_after_reload_reset") {
-        out.push_str("; ");
-        out.push_str(PERSISTENCE_RELOAD_REPAIR_REQUIREMENT);
-    } else if failure_kind.contains("token_echo_after_reload_only") {
+        out.push_str(requirement);
+    }
+    if failure_kind.contains("token_echo_after_reload_only") {
         out.push_str("; ");
         out.push_str(TEXT_ECHO_AFTER_RELOAD_REPAIR_REQUIREMENT);
     } else if failure_kind.contains("token_echo_missing") {
         out.push_str("; ");
         out.push_str(TEXT_ECHO_REPAIR_REQUIREMENT);
     }
-    let context = final_acceptance_behavioral_probe_context(report, &[]);
+    let context = final_acceptance_behavioral_probe_context(profile, goal, report, &[]);
     if !context.is_empty() {
         out.push('\n');
         out.push_str(context.trim());
@@ -2438,31 +2366,36 @@ pub(super) fn final_acceptance_recovery_repair_targets(
 }
 
 pub(super) fn final_acceptance_recovery_failure_evidence(
+    profile: &str,
+    goal: &str,
     report: &VerificationReport,
     reason: &str,
 ) -> Vec<String> {
-    final_acceptance_recovery_failure_evidence_base(None, "", report, reason)
+    final_acceptance_recovery_failure_evidence_base(None, profile, goal, report, reason)
 }
 
 pub(super) fn final_acceptance_recovery_failure_evidence_with_context(
     root: &Path,
     profile: &str,
+    goal: &str,
     report: &VerificationReport,
     reason: &str,
 ) -> Vec<String> {
-    final_acceptance_recovery_failure_evidence_base(Some(root), profile, report, reason)
+    final_acceptance_recovery_failure_evidence_base(Some(root), profile, goal, report, reason)
 }
 
 pub(super) fn final_acceptance_recovery_failure_evidence_base(
     root: Option<&Path>,
     profile: &str,
+    goal: &str,
     report: &VerificationReport,
     reason: &str,
 ) -> Vec<String> {
     let pending_keys = verification_missing_signals(report);
     let failure_kind = final_acceptance_app_behavior_failure_kind(report).unwrap_or_default();
     let probe_json = interaction_probe_json_from_report(report);
-    let mut evidence = interaction_root_cause_repair_guidance(&failure_kind, probe_json.as_ref());
+    let mut evidence =
+        interaction_root_cause_repair_guidance(profile, goal, &failure_kind, probe_json.as_ref());
     let pending_evidence = if let Some(root) = root.filter(|_| !pending_keys.is_empty()) {
         capability_evidence_failure_evidence(root, profile, &pending_keys, reason)
     } else {

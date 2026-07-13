@@ -125,6 +125,14 @@ artifact_path_contains = ["postcss.config.", "tailwind.config.", "next.config."]
 package_check_marker = "package.json scripts port"
 scaffold_check_marker = "scaffold tsconfig postcss tailwind"
 
+[repair_guidance]
+generic_interaction = "input operations must visibly change actual application state, and that change must be reflected in the data-anvil-state JSON snapshot; wire input handlers to state updates."
+start_interaction = "primary/start controls must transition the visible app state before input is evaluated; wire the start action into state and render updates."
+canvas_game_interaction = "keyboard or pointer input must visibly change game state (player position, projectiles, score/health, or state transitions); wire input handlers into the render/update loop."
+canvas_render_loop_checklist = "render-loop checklist: ref attached -> effect runs -> rAF loop starts -> draw calls"
+canvas_input_wiring_checklist = "input-wiring checklist: keyboard or pointer input must visibly change game state (player position, projectiles, score/health, or state transitions); wire input handlers into the render/update loop."
+persistence = "load persisted state on mount (e.g. read localStorage in initialization) and write on mutation"
+
 [contracts]
 state_binding_contract = '''Minimum contract: after start and after input, the `data-anvil-state` JSON value must actually change. The snapshot must include at least one dimension that immediately responds to input, such as player/paddle x position. If refs are used, mirror meaningful state changes into React state so a render occurs.'''
 input_coupled_dimension_requirement = "入力は {mutation_refs} を変異させるが data-anvil-state に映らない。入力連動次元（例: プレイヤー/パドルのx座標）をReact stateにミラーしてスナップショットへ追加せよ。"

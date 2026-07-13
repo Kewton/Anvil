@@ -1,0 +1,38 @@
+case_id = "test0713_contract_scoped_interaction_guidance"
+source = "test0712_gab_001 #10 non-game interaction guidance regression"
+required_paths = []
+verify_commands = []
+required_capabilities = []
+required_evidence = []
+required_obligations = []
+deferred_verify_requirements = []
+evidence_hint_tokens = ["quiz", "interaction", "guidance", "contract"]
+
+[route_closure]
+include = []
+exclude = []
+
+[weak_evidence]
+contains = []
+
+[diagnostics]
+contains = []
+
+[compile]
+expect = "not_checked"
+
+[fixture_contains]
+fixtures/contract-scoped-guidance.jsonl = [
+  "test0712_gab_001/#10",
+  "\"scenario\":\"quiz\"",
+  "\"variant\":\"generic_interaction\"",
+  "data-anvil-state JSON snapshot",
+  "\"excluded_terms\":[\"projectiles\",\"rAF loop\"]",
+  "\"scenario\":\"space\"",
+  "\"variant\":\"canvas_game_interaction\"",
+  "player position, projectiles, score/health",
+  "render-loop checklist",
+  "\"scenario\":\"notes\"",
+  "\"variant\":\"persistence\"",
+  "load persisted state on mount"
+]
