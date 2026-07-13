@@ -4,6 +4,8 @@ use std::path::Path;
 
 use crate::planner::verify::VerificationReport;
 
+pub mod results_schema;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProfileSnapshot {
     pub protected_files: Vec<ProtectedFile>,
