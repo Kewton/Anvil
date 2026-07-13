@@ -2382,6 +2382,22 @@ fn hook_attribute_grep_check_command(tokens: &[ShellWord]) -> Option<String> {
     Some(hook_attribute_check_command(&assertion, &source_path))
 }
 
+pub fn hook_attribute_present_check_command(
+    attribute: &str,
+    value: &str,
+    source_path: &str,
+) -> Option<String> {
+    let source_path = hook_source_path(source_path)?;
+    let assertion = match attribute {
+        "action" if safe_hook_action_value(value) => HookGrepAssertion::Action {
+            value: value.to_string(),
+        },
+        "state" if value.is_empty() => HookGrepAssertion::State,
+        _ => return None,
+    };
+    Some(hook_attribute_check_command(&assertion, &source_path))
+}
+
 fn parse_hook_grep_assertion(pattern: &str) -> Option<HookGrepAssertion> {
     parse_data_anvil_action_grep(pattern)
         .map(|value| HookGrepAssertion::Action { value })
@@ -2533,7 +2549,7 @@ fn hook_attribute_check_command(assertion: &HookGrepAssertion, source_path: &str
     }
 }
 
-fn package_json_script_check_command(pattern: &str) -> Option<String> {
+pub fn package_json_script_check_command(pattern: &str) -> Option<String> {
     if let Some(port) = package_json_port_only_pattern(pattern) {
         return Some(package_json_port_script_check_command(&port));
     }
@@ -2576,7 +2592,7 @@ fn package_json_port_only_pattern(pattern: &str) -> Option<String> {
     }
 }
 
-fn package_json_port_script_check_command(port: &str) -> String {
+pub fn package_json_port_script_check_command(port: &str) -> String {
     // Keep the expression free of shell-control bytes so repaired commands can be revalidated.
     format!(
         concat!(
