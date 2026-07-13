@@ -146,6 +146,7 @@ mod tests {
                 "interactive_ui_source_evidence",
                 "non_static_screen_evidence",
                 "score_or_progression_evidence",
+                "browser_interaction_failed",
             ]
         );
         assert_eq!(

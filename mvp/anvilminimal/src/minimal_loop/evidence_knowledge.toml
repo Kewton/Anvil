@@ -319,6 +319,7 @@ evidence_kinds = [
   "interactive_ui_source_evidence",
   "non_static_screen_evidence",
   "score_or_progression_evidence",
+  "browser_interaction_failed",
 ]
 path_candidates = [
   "src/app/page.tsx",

@@ -71,11 +71,18 @@ pub(crate) struct FinalAcceptanceRepairTargetInput<'a> {
     pub(crate) contract_attribute_paths: &'a [String],
     pub(crate) repair_changed_paths: &'a [String],
     pub(crate) required_paths: &'a [String],
+    pub(crate) diagnosis_path: Option<&'a str>,
 }
 
 pub(crate) fn resolve_final_acceptance_repair_targets(
     input: FinalAcceptanceRepairTargetInput<'_>,
 ) -> FinalAcceptanceRepairTargets {
+    if let Some(path) = input.diagnosis_path.filter(|path| !path.trim().is_empty()) {
+        return FinalAcceptanceRepairTargets {
+            selected_targets: ordered_non_empty_paths(&[path]),
+            selection_reason: "diagnosis_mapped".to_string(),
+        };
+    }
     resolve_repair_targets(RepairTargetResolutionInput {
         root: input.root,
         profile: input.profile,
@@ -218,6 +225,9 @@ pub(crate) fn missing_obligation_targets_from_text(text: &str) -> Vec<String> {
 
 fn push_normalized_evidence_keys(out: &mut Vec<String>, raw: &str) {
     let mut found = false;
+    if raw.contains("browser_interaction_failed:") {
+        push_unique_trimmed(out, "browser_interaction_failed");
+    }
     for token in raw.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_')) {
         if canonical_evidence_token(token) {
             push_unique_trimmed(out, token);
@@ -560,8 +570,8 @@ mod tests {
             contract_attribute_paths: &[],
             repair_changed_paths: &[],
             required_paths: &["package.json".to_string(), "src/app/page.tsx".to_string()],
+            diagnosis_path: None,
         });
-
         assert_eq!(selection.primary_target(), Some("src/app/page.tsx"));
         assert_eq!(selection.selected_targets, vec!["src/app/page.tsx"]);
         assert_eq!(selection.selection_reason, "evidence_mapped");
@@ -584,6 +594,7 @@ mod tests {
                     contract_attribute_paths: &[],
                     repair_changed_paths: &[],
                     required_paths: &["package.json".to_string(), "src/app/page.tsx".to_string()],
+                    diagnosis_path: None,
                 });
 
             assert_eq!(selection.primary_target(), Some("src/app/page.tsx"));

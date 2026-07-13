@@ -16,6 +16,25 @@ pub struct ContractAttributeIssue {
     pub path: String,
 }
 
+pub(crate) fn issue_from_hook_status(
+    status: &str,
+    path: impl Into<String>,
+) -> Option<ContractAttributeIssue> {
+    let attribute = match status.trim() {
+        "primary_missing" => "data-anvil-action=\"primary\"",
+        "restart_missing" => "data-anvil-action=\"restart\"",
+        "input_missing" => "data-anvil-action=\"input\"",
+        "search_missing" => "data-anvil-action=\"search\"",
+        "submit_missing" => "data-anvil-action=\"submit\"",
+        "state_missing" | "state_invalid" => "data-anvil-state",
+        _ => return None,
+    };
+    Some(ContractAttributeIssue {
+        attribute: attribute.to_string(),
+        path: path.into(),
+    })
+}
+
 pub fn detect(report: &VerificationReport) -> Option<ContractAttributeIssue> {
     report
         .command_failures
@@ -419,6 +438,39 @@ mod tests {
         let guidance = guidance_section(None, &report, None);
         assert!(guidance.contains("main start, submit, or primary action control"));
         assert!(guidance.contains(r#"data-anvil-action="primary""#));
+    }
+
+    #[test]
+    fn hook_status_renders_primary_guidance_with_target_excerpt() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        std::fs::write(
+            dir.path().join("src/app/page.tsx"),
+            "export default function Page() {\n  return <main><button>Start</button></main>;\n}\n",
+        )
+        .unwrap();
+        let events = dir.path().join("events.jsonl");
+        let issue = issue_from_hook_status("primary_missing", "src/app/page.tsx").unwrap();
+
+        let guidance = guidance_for_issue(Some(dir.path()), &issue, Some(&events));
+
+        assert!(
+            guidance.contains(r#"data-anvil-action="primary""#),
+            "{guidance}"
+        );
+        assert!(guidance.contains("likely insertion area"), "{guidance}");
+        assert!(guidance.contains("near line 2"), "{guidance}");
+        assert!(guidance.contains(&knowledge::get().contracts.primary_example));
+        assert_eq!(
+            issue_from_hook_status("restart_missing", "src/app/page.tsx")
+                .unwrap()
+                .attribute,
+            r#"data-anvil-action="restart""#
+        );
+        let event = event_values(&events).pop().unwrap();
+        assert_eq!(event["event"], "contract_attribute_repair_guidance");
+        assert_eq!(event["attribute"], r#"data-anvil-action="primary""#);
+        assert_eq!(event["path"], "src/app/page.tsx");
     }
 
     #[test]

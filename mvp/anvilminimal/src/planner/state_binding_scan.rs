@@ -93,15 +93,31 @@ pub(crate) fn final_acceptance_feedback(
     report: &VerificationReport,
     eval_events_path: Option<&Path>,
 ) -> String {
+    if !final_acceptance_interaction_triggered(report) {
+        return String::new();
+    }
+    feedback_for_triggered_scan(root, profile, eval_events_path)
+}
+
+pub(crate) fn final_acceptance_actionable_diagnosis(
+    root: &Path,
+    profile: &str,
+    report: &VerificationReport,
+) -> Option<StateBindingDiagnosis> {
+    if !final_acceptance_interaction_triggered(report) {
+        return None;
+    }
+    let diagnosis = diagnose_route_bound_state_binding(root, profile);
+    diagnosis.diagnosis.actionable().then_some(diagnosis)
+}
+
+fn final_acceptance_interaction_triggered(report: &VerificationReport) -> bool {
     let mut triggers = Vec::new();
     collect_interaction_state_triggers(&report.primary_reason(), &mut triggers);
     for failure in &report.profile_failures {
         collect_interaction_state_triggers(failure, &mut triggers);
     }
-    if triggers.is_empty() {
-        return String::new();
-    }
-    feedback_for_triggered_scan(root, profile, eval_events_path)
+    !triggers.is_empty()
 }
 
 pub(crate) fn write_required_feedback(

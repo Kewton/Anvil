@@ -784,11 +784,20 @@ pub fn run_ultra_plan_with_ui(
             let mut expected_paths =
                 final_acceptance_repair_expected_paths(plan, config, &acceptance_report)?;
             let pending_repair_evidence = escalation_carryover.carry_pending_evidence(
-                verification_missing_signals(&acceptance_report),
+                final_acceptance_repair_signals(&acceptance_report),
                 &ultra_context.pending_capability_evidence,
             );
-            let contract_attribute_paths =
-                contract_attribute_repair_target_paths(&acceptance_report);
+            let contract_attribute_paths = contract_attribute_repair_target_paths(
+                &config.workspace_root,
+                &plan.profile,
+                &acceptance_report,
+            );
+            let diagnosis =
+                crate::planner::state_binding_scan::final_acceptance_actionable_diagnosis(
+                    &config.workspace_root,
+                    &plan.profile,
+                    &acceptance_report,
+                );
             let target_selection =
                 crate::planner::repair_targeting::resolve_final_acceptance_repair_targets(
                     crate::planner::repair_targeting::FinalAcceptanceRepairTargetInput {
@@ -798,6 +807,7 @@ pub fn run_ultra_plan_with_ui(
                         contract_attribute_paths: &contract_attribute_paths,
                         repair_changed_paths: &ultra_context.last_repair_changed_paths,
                         required_paths: &expected_paths,
+                        diagnosis_path: diagnosis.as_ref().map(|diagnosis| diagnosis.path.as_str()),
                     },
                 );
             merge_unique_strings(&mut expected_paths, &target_selection.selected_targets);
@@ -1011,7 +1021,7 @@ pub fn run_ultra_plan_with_ui(
                     "compile_errors": acceptance_report.compile_errors.clone(),
                     "profile_failures": acceptance_report.profile_failures.clone(),
                     "deterministic_remedies_applied": deterministic_remedies_applied.clone(),
-                    "selected_evidence_keys": before_missing_keys.clone(),
+                    "selected_evidence_keys": pending_repair_evidence.clone(),
                     "selected_target": target_selection.primary_target().unwrap_or_default(),
                     "selected_targets": target_selection.selected_targets.clone(),
                     "selection_reason": target_selection.selection_reason.clone(),

@@ -238,19 +238,42 @@ mod moved {
         let src = dir.path().join("src/app");
         std::fs::create_dir_all(&src).unwrap();
         std::fs::write(
+            dir.path().join("package.json"),
+            nextjs_complete_package_json(),
+        )
+        .unwrap();
+        std::fs::write(
             src.join("page.tsx"),
             r#"
-import { useState } from "react";
+import { useEffect, useRef } from "react";
 export default function Game() {
-  const [score, setScore] = useState(0);
-  return <main data-anvil-state={JSON.stringify({ score })} />;
+  const gameRef = useRef({ score: 0 });
+  useEffect(() => {
+    const tick = () => {
+      gameRef.current.score += 1;
+      requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  }, []);
+  return <main><button>Start</button><output data-anvil-state={JSON.stringify({ score: gameRef.current.score })} /></main>;
 }
 "#,
         )
         .unwrap();
-        let report = VerificationReport::profile_failed(
+        let interaction = dir.path().join("browser-interaction.json");
+        std::fs::write(
+            &interaction,
+            r#"{"failure_kind":"input_state_change_missing_after_start","contract_hook_status":"primary_missing","action_hooks":[],"state_dimensions_changed":[]}"#,
+        )
+        .unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut report = VerificationReport::profile_failed(
             "browser_interaction_failed:input_state_change_missing_after_start",
         );
+        report.push_profile_failure(format!(
+            "interaction evidence path: {}",
+            interaction.display()
+        ));
         let plan = UltraPlan {
             goal: "Create an interactive browser game".to_string(),
             profile: "nextjs".to_string(),
@@ -258,8 +281,34 @@ export default function Game() {
             intent: "create".to_string(),
             phases: Vec::new(),
         };
+        let pending_evidence = final_acceptance_repair_signals(&report);
+        assert_eq!(
+            pending_evidence,
+            vec!["browser_interaction_failed:input_state_change_missing_after_start"]
+        );
+        let diagnosis = crate::planner::state_binding_scan::final_acceptance_actionable_diagnosis(
+            dir.path(),
+            "nextjs",
+            &report,
+        )
+        .unwrap();
+        assert_eq!(diagnosis.path, "src/app/page.tsx");
+        assert_eq!(diagnosis.diagnosis.as_str(), "state_bound_to_ref");
+        let selection = crate::planner::repair_targeting::resolve_final_acceptance_repair_targets(
+            crate::planner::repair_targeting::FinalAcceptanceRepairTargetInput {
+                root: dir.path(),
+                profile: "nextjs",
+                pending_evidence: &pending_evidence,
+                contract_attribute_paths: &[],
+                repair_changed_paths: &[],
+                required_paths: &["package.json".to_string(), "src/app/page.tsx".to_string()],
+                diagnosis_path: Some(&diagnosis.path),
+            },
+        );
+        assert_eq!(selection.selected_targets, vec!["src/app/page.tsx"]);
+        assert_eq!(selection.selection_reason, "diagnosis_mapped");
 
-        let prompt = final_acceptance_repair_prompt(
+        let prompt = final_acceptance_repair_prompt_with_events(
             dir.path(),
             PromptLayout::Stable,
             &plan,
@@ -271,6 +320,7 @@ export default function Game() {
             (1, 1),
             false,
             false,
+            Some(&events),
         );
 
         assert!(
@@ -278,13 +328,79 @@ export default function Game() {
             "{prompt}"
         );
         assert!(
-            prompt.contains("State binding diagnosis: setter_never_called"),
+            prompt.contains("State binding diagnosis: state_bound_to_ref"),
             "{prompt}"
         );
         assert!(
             prompt.contains("after start and after input, the `data-anvil-state` JSON value"),
             "{prompt}"
         );
+        assert!(
+            prompt.contains("Contract attribute repair guidance:"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains(r#"data-anvil-action="primary""#),
+            "{prompt}"
+        );
+        assert!(prompt.contains("src/app/page.tsx"), "{prompt}");
+        assert!(prompt.contains("near line"), "{prompt}");
+        assert!(
+            prompt.contains(
+                &crate::planner::profiles::nextjs::knowledge::get()
+                    .contracts
+                    .primary_example
+            ),
+            "{prompt}"
+        );
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(
+            event_text.contains(r#""event":"state_binding_diagnosis""#),
+            "{event_text}"
+        );
+        assert!(
+            event_text.contains(r#""event":"contract_attribute_repair_guidance""#),
+            "{event_text}"
+        );
+        assert!(
+            event_text.contains(r#""attribute":"data-anvil-action=\"primary\"""#),
+            "{event_text}"
+        );
+    }
+
+    #[test]
+    fn interaction_failure_without_diagnosis_uses_route_bound_evidence_mapping() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            nextjs_complete_package_json(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/app/page.tsx"),
+            "export default function Page(){ return <main>Quiz</main>; }\n",
+        )
+        .unwrap();
+        let report = VerificationReport::profile_failed(
+            "browser_interaction_failed:input_state_change_missing_after_start",
+        );
+        let pending_evidence = final_acceptance_repair_signals(&report);
+
+        let selection = crate::planner::repair_targeting::resolve_final_acceptance_repair_targets(
+            crate::planner::repair_targeting::FinalAcceptanceRepairTargetInput {
+                root: dir.path(),
+                profile: "nextjs",
+                pending_evidence: &pending_evidence,
+                contract_attribute_paths: &[],
+                repair_changed_paths: &[],
+                required_paths: &["package.json".to_string()],
+                diagnosis_path: None,
+            },
+        );
+
+        assert_eq!(selection.selected_targets, vec!["src/app/page.tsx"]);
+        assert_eq!(selection.selection_reason, "evidence_mapped");
     }
 
     #[test]

@@ -1119,6 +1119,14 @@ pub(super) fn final_acceptance_app_behavior_failure_kind(
         .find_map(app_behavior_probe_failure_kind)
 }
 
+pub(super) fn final_acceptance_repair_signals(report: &VerificationReport) -> Vec<String> {
+    let mut signals = verification_missing_signals(report);
+    if let Some(failure) = final_acceptance_app_behavior_failure_kind(report) {
+        merge_unique_strings(&mut signals, &[failure]);
+    }
+    signals
+}
+
 pub(super) fn final_acceptance_repair_expected_paths(
     plan: &UltraPlan,
     config: &Config,
@@ -1134,10 +1142,39 @@ pub(super) fn final_acceptance_repair_expected_paths(
     Ok(expected)
 }
 
-pub(super) fn contract_attribute_repair_target_paths(report: &VerificationReport) -> Vec<String> {
-    crate::planner::contract_attribute_repair::detect(report)
-        .map(|issue| vec![issue.path])
-        .unwrap_or_default()
+pub(super) fn contract_attribute_repair_target_paths(
+    root: &Path,
+    profile: &str,
+    report: &VerificationReport,
+) -> Vec<String> {
+    let hook_status = interaction_probe_json_from_report(report)
+        .and_then(|value| raw_text_field_deep(&value, &["contract_hook_status"]));
+    crate::planner::final_acceptance_contract::target_paths(
+        root,
+        profile,
+        report,
+        hook_status.as_deref(),
+    )
+}
+
+fn final_acceptance_contract_attribute_guidance(
+    root: &Path,
+    profile: &str,
+    report: &VerificationReport,
+    eval_events_path: Option<&Path>,
+) -> String {
+    let Some(status) = interaction_probe_json_from_report(report)
+        .and_then(|value| raw_text_field_deep(&value, &["contract_hook_status"]))
+    else {
+        return String::new();
+    };
+    crate::planner::final_acceptance_contract::guidance_for_hook_status(
+        root,
+        profile,
+        report,
+        &status,
+        eval_events_path,
+    )
 }
 
 pub(super) fn compile_error_paths(errors: &[CompileError]) -> Vec<String> {
@@ -1205,8 +1242,8 @@ pub(super) fn final_acceptance_evidence_regeneration_target(
     report: &VerificationReport,
     expected_paths: &[String],
 ) -> Option<String> {
-    let pending_evidence = verification_missing_signals(report);
-    let contract_attribute_paths = contract_attribute_repair_target_paths(report);
+    let pending_evidence = final_acceptance_repair_signals(report);
+    let contract_attribute_paths = contract_attribute_repair_target_paths(root, profile, report);
     crate::planner::repair_targeting::resolve_repair_targets(
         crate::planner::repair_targeting::RepairTargetResolutionInput {
             root,
@@ -1853,6 +1890,13 @@ pub(super) fn final_acceptance_repair_prompt_stable(
     } else {
         format!("State binding repair guidance:\n{state_binding_guidance}\n\n")
     };
+    let contract_attribute_guidance =
+        final_acceptance_contract_attribute_guidance(root, &plan.profile, report, eval_events_path);
+    let contract_attribute_guidance = if contract_attribute_guidance.is_empty() {
+        String::new()
+    } else {
+        format!("{contract_attribute_guidance}\n\n")
+    };
     let command_failures = command_failure_summaries(report);
     let command_failures = render_prompt_bullets(&command_failures);
     let compile_errors = compile_repair_prompt_section_with_root(
@@ -1874,6 +1918,7 @@ Original ultra goal:\n{goal}\n\n\
 Profile: {profile}\nIntent: {intent}\n\n\
 Pending capability evidence remedies:\n{pending_evidence_guidance}\n\n\
 {state_binding_guidance}\
+{contract_attribute_guidance}\
 Missing paths:\n{missing}\n\n\
 Dependency failures:\n{dependencies}\n\n\
 Compile errors:\n{compile_errors}\n\n\
@@ -1898,6 +1943,7 @@ Final acceptance failure:\n\
         max_attempts = max_attempts,
         pending_evidence_guidance = pending_evidence_guidance,
         state_binding_guidance = state_binding_guidance,
+        contract_attribute_guidance = contract_attribute_guidance,
         missing = missing,
         dependencies = dependencies,
         compile_errors = compile_errors,
@@ -1950,6 +1996,13 @@ pub(super) fn final_acceptance_repair_prompt_legacy(
     } else {
         format!("State binding repair guidance:\n{state_binding_guidance}\n\n")
     };
+    let contract_attribute_guidance =
+        final_acceptance_contract_attribute_guidance(root, &plan.profile, report, eval_events_path);
+    let contract_attribute_guidance = if contract_attribute_guidance.is_empty() {
+        String::new()
+    } else {
+        format!("{contract_attribute_guidance}\n\n")
+    };
     let command_failures = command_failure_summaries(report);
     let command_failures = render_prompt_bullets(&command_failures);
     let compile_errors = compile_repair_prompt_section_with_root(
@@ -1970,6 +2023,7 @@ Final acceptance failure:\n\
 - attempt: {attempt}/{max_attempts}\n\n\
 Pending capability evidence remedies:\n{pending_evidence_guidance}\n\n\
 {state_binding_guidance}\
+{contract_attribute_guidance}\
 Missing paths:\n{missing}\n\n\
 Dependency failures:\n{dependencies}\n\n\
 Compile errors:\n{compile_errors}\n\n\
@@ -1994,6 +2048,7 @@ Bounded repair rules:\n\
         max_attempts = max_attempts,
         pending_evidence_guidance = pending_evidence_guidance,
         state_binding_guidance = state_binding_guidance,
+        contract_attribute_guidance = contract_attribute_guidance,
         missing = missing,
         dependencies = dependencies,
         compile_errors = compile_errors,

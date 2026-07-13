@@ -1,0 +1,36 @@
+case_id = "test0713_t27_interaction_diagnosis_target"
+source = "test0712_gab_001 #10 interaction-only final acceptance repair regression"
+required_paths = []
+verify_commands = []
+required_capabilities = []
+required_evidence = []
+required_obligations = []
+deferred_verify_requirements = []
+evidence_hint_tokens = ["interaction", "diagnosis", "primary", "route-bound"]
+
+[route_closure]
+include = []
+exclude = []
+
+[weak_evidence]
+contains = []
+
+[diagnostics]
+contains = []
+
+[compile]
+expect = "not_checked"
+
+[fixture_contains]
+fixtures/interaction-diagnosis-target.jsonl = [
+  "test0712_gab_001/#10",
+  "\"event\":\"state_binding_diagnosis\"",
+  "\"diagnosis\":\"state_bound_to_ref\"",
+  "\"selected_evidence_keys\":[\"browser_interaction_failed:input_state_change_missing_after_start\"]",
+  "\"selected_targets\":[\"src/app/page.tsx\"]",
+  "\"selection_reason\":\"diagnosis_mapped\"",
+  "\"event\":\"contract_attribute_repair_guidance\"",
+  "data-anvil-action=\\\"primary\\\"",
+  "Contract attribute repair guidance:",
+  "near line 106"
+]

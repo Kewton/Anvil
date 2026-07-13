@@ -91,6 +91,12 @@ loop-level回帰テストに固定した。バッチ検証では同クラスの�
 `test0712_bs_001` #6の観測。ゲート2回＋直近4計測セットで再発なし。
 n=1・未再現につきwatch解除。再発時は当該runの`repair.md`で裁定する。
 
+T27 status: REOPENED -> CLOSED (root-caused, fixed by T27)。
+`test0712_gab_001` #10でinteraction失敗単独時に診断済みのroute-bound sourceが
+修復ターゲットへ接続されず、`required_path`の先頭`package.json`へ落ちる同属事象を
+再確認した。確定`state_binding_diagnosis`のpathを最優先ターゲットへ接続し、
+interaction failureのevidence mappingとcontract hook guidanceも接続して閉鎖した。
+
 ### Dependency Setup Network Stall [OPEN (low priority)]
 
 依存セットアップのネットワーク停滞は低優先度のままOPENとする。既存の
