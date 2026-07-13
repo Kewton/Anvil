@@ -1,0 +1,13 @@
+goal: "data/sales.csv を読み込み、月次×地域の売上集計と全体合計を計算し、無効な行は理由別に除外して件数を明記した上で、要約レポートを作成してください。"
+profile: "data"
+style: "default"
+intent: "create"
+phases:
+  - id: "load-and-define-validation-rules"
+    prompt: "Load data/sales.csv, inspect its column structure, and define deterministic validation rules for identifying invalid rows based on expected data types, date formats, valid region codes, and non-negative sales amounts."
+  - id: "filter-invalid-rows-and-categorize-reasons"
+    prompt: "Apply the validation rules to data/sales.csv, filter out invalid rows, categorize each exclusion by specific reason, count exclusions per reason, and produce a cleaned dataset ready for aggregation."
+  - id: "compute-aggregations-and-totals"
+    prompt: "Calculate monthly and regional sales aggregations from the cleaned dataset, compute the overall total sum, and structure the results in a tabular format suitable for reporting."
+  - id: "generate-summary-report"
+    prompt: "Generate the final summary report containing the monthly×regional aggregation table, total sales sum, and invalid row exclusion breakdown with reasons and counts, saving it as output/sales_summary_report.md."

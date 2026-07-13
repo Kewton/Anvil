@@ -1,0 +1,23 @@
+goal: "Original ultra goal: data/sales.csv を読み込み、月次×地域の売上集計と全体合計を計算し、無効な行は理由別に除外して件数を明記した上で、要約レポートを作成してください。\nProfile: data\nStyle: default\nIntent: create\nPhase id: load-and-define-validation-rules\nPhase task: Load data/sales.csv, inspect its column structure, and define deterministic validation rules for identifying invalid rows based on expected data types, date formats, valid region codes, and non-negative sales amounts.\n\nWorkspace snapshot:\n- data\n\nPrior ultra context:\n- Pending final artifacts:\n  - pipeline/main.py\n  - output/results.json\n\nUnmet final requirements from earlier phases:\n- none\n\nRequested features not yet detected:\n- aggregation\n- aggregations\n- amounts\n- apply\n- based\n- breakdown\n- … and 60 more\n\nProfile generation rules:\nThe pipeline must be deterministic: use a fixed seed whenever randomness is unavoidable, do not depend on execution time, and keep iteration and output ordering stable. This is class knowledge required by docs/data-profile-contract.md section 8.\nProfile runtime contract:\n- Generate pipeline/main.py, output/results.json, and output/report.md or output/report.html.\n- Write reconciliation and values using the fixed results schema.\n- input_rows must equal used_rows plus the sum of excluded rows.\n- A rerun must reproduce the complete output/results.json document exactly; time, random state, and unstable iteration order may not change results.Deterministic verification preference:\n- none\n\n\nRequired final artifacts:\n- pipeline/main.py\n- output/results.json\n\nRequired final capabilities:\n- data_reconciliation\n- data_claims_binding\n- data_rerun_consistency\n- data_results_schema"
+steps:
+  - id: "create-pipeline"
+    kind: "implement"
+    expected_result: "pass"
+    instruction: "Create pipeline/main.py. The script must: 1) Read data/sales.csv. 2) Define validation rules: date must be parseable, region must be in a valid set, amount must be non-negative numeric. 3) Filter invalid rows, tracking reasons (e.g., 'invalid_date', 'invalid_region', 'negative_amount'). 4) Aggregate valid rows by month and region, calculating total sales. 5) Write output/results.json with schema: {input_rows, used_rows, excluded_rows: [{reason, count}], aggregations: [{month, region, total}], totals: {grand_total}}. 6) Write output/report.md summarizing the findings."
+    expected_paths:
+      - "pipeline/main.py"
+    verify:
+  - id: "create-verify-script"
+    kind: "implement"
+    expected_result: "pass"
+    instruction: "Create tests/verify_pipeline.py. The script must: 1) Execute pipeline/main.py. 2) Load output/results.json. 3) Assert JSON is valid. 4) Assert input_rows == used_rows + sum(excluded_rows counts). 5) Assert aggregations list is non-empty and contains month, region, total keys. 6) Assert output/report.md exists and is non-empty.\n\nProfile contract:\nBuild one reproducible tabular-data pipeline with Python 3 standard-library csv/json/statistics only. Preserve input files and write pipeline/main.py, output/results.json, and one output/report artifact.\nThe pipeline must be deterministic: use a fixed seed whenever randomness is unavoidable, do not depend on execution time, and keep iteration and output ordering stable. This is class knowledge required by docs/data-profile-contract.md section 8.\nA rerun must reproduce the complete output/results.json document exactly; time, random state, and unstable iteration order may not change results.\nRepair pipeline/main.py or its generated artifacts; never weaken the evidence checks."
+    expected_paths:
+      - "tests/verify_pipeline.py"
+    verify:
+  - id: "run-verification"
+    kind: "verify"
+    expected_result: "pass"
+    instruction: "Run the verification script to validate pipeline logic, schema compliance, and reconciliation rules."
+    expected_paths:
+    verify:
+      - "python tests/verify_pipeline.py"
