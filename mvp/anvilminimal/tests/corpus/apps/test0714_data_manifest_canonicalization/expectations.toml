@@ -1,12 +1,12 @@
 case_id = "test0714_data_manifest_canonicalization"
-source = "uat-test0713-data-001 runs 1, 2, and 4 canonicalization regressions"
+source = "uat-test0713-data-001 runs 1-4 canonicalization and workspace execution regressions"
 required_paths = []
 verify_commands = []
 required_capabilities = []
 required_evidence = []
 required_obligations = []
 deferred_verify_requirements = []
-evidence_hint_tokens = ["data", "inspection", "results-schema", "dependency-denial"]
+evidence_hint_tokens = ["data", "inspection", "results-schema", "dependency-denial", "workspace-cd"]
 
 [route_closure]
 include = []
@@ -47,4 +47,12 @@ fixtures/run4-instruction-schema.jsonl = [
   "\"event\":\"dependency_denial_guidance\"",
   "Python 3 standard library only (csv/json/statistics)",
   "\"repair_exhausted\":false"
+]
+fixtures/run3-workspace-root-cd.jsonl = [
+  "uat-test0713-data-001/run-3",
+  "cd /Users/<user>/share/work/localwork/commandagent_mvp/01/test0713_data_001/run-3 &&",
+  "\"event\":\"workspace_cd_stripped\"",
+  "\"original_prefix\":\"cd /Users/<user>/share/work/localwork/commandagent_mvp/01/test0713_data_001/run-3 &&\"",
+  "\"normalized_command\":\"python3 pipeline/main.py\"",
+  "\"status\":\"ok\""
 ]

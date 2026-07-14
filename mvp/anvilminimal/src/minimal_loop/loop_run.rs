@@ -37,8 +37,7 @@ use super::completion::{
 };
 use super::dependency_setup::{self, NodeDependencySetupAuthority, NodeDependencySetupStatus};
 use super::edit_anchor_recovery::{
-    EDIT_ANCHOR_FULL_FILE_WRITE_THRESHOLD, EditAnchorRecovery, EditAnchorRecoveryState,
-    emit_recovery_event,
+    EDIT_ANCHOR_FULL_FILE_WRITE_THRESHOLD, EditAnchorRecoveryState, emit_recovery_event,
 };
 use super::evidence::{RuntimeAcceptanceReport, verify_runtime_acceptance};
 use super::import_scan::{format_missing_import_feedback, scan_relative_imports};
@@ -1965,7 +1964,11 @@ pub(crate) fn run_session_with_outcome_with_options(
                                 decision.policy_error_kind
                             );
                         }
-                        let feedback = recoverable_tool_feedback(&call.name, &policy_error, None);
+                        let feedback = super::tool_feedback::recoverable_tool_feedback(
+                            &call.name,
+                            &policy_error,
+                            None,
+                        );
                         session.messages.push(ConversationMessage::tool_result(
                             call.name,
                             Some(call.id),
@@ -2167,7 +2170,11 @@ pub(crate) fn run_session_with_outcome_with_options(
                         );
                         bail!("recoverable tool error repeated: {kind}");
                     }
-                    recoverable_tool_feedback(&call.name, &err, edit_anchor_recovery.as_ref())
+                    super::tool_feedback::recoverable_tool_feedback(
+                        &call.name,
+                        &err,
+                        edit_anchor_recovery.as_ref(),
+                    )
                 }
                 Err(err) => {
                     eval_events::emit(
@@ -4959,35 +4966,6 @@ fn looks_like_action_prompt(content: &str) -> bool {
         || lower.contains("実装")
         || lower.contains("修正")
         || lower.contains("追加")
-}
-
-fn recoverable_tool_feedback(
-    name: &str,
-    err: &anyhow::Error,
-    edit_anchor_recovery: Option<&EditAnchorRecovery>,
-) -> String {
-    let err_text = err.to_string();
-    if err_text.contains("verify_command_policy_error") {
-        return format!(
-            "Tool call `{name}` was rejected by deterministic verify policy: {err_text}. Allowed alternatives: use one bounded verifier command such as `npm run build`, `cargo test`, `python -m compileall -q src`, or `test -f relative/path`; create files with the Write tool; keep verify to one deterministic command; python-cli behavior-probe fixture CSVs already exist when required; move dependency installation or dev-server startup to setup/runtime phases, not verify."
-        );
-    }
-    if err_text.contains("stale_absolute_path_recoverable") {
-        return format!(
-            "Tool call `{name}` used an absolute path outside the current workspace and was rejected: {err_text}. Retry with the workspace-relative path named in the error; do not use an absolute path from another workspace."
-        );
-    }
-    if err_text.contains("tool_args_path_near_root_corruption") {
-        return format!(
-            "Tool call `{name}` used a path that appears to reconstruct the current workspace root with a digit variance and was rejected. Do not salvage or write across workspaces; retry with a workspace-relative path under the exact current root quoted in the error: {err_text}."
-        );
-    }
-    if let Some(recovery) = edit_anchor_recovery {
-        return super::edit_anchor_recovery::feedback(name, &err_text, recovery);
-    }
-    format!(
-        "Tool call `{name}` was rejected with a recoverable validation error: {err}. Retry with the same tool or another available tool using a valid JSON object that matches the tool schema."
-    )
 }
 
 fn changed_path_from_call(root: &Path, arguments: &serde_json::Value) -> Option<String> {

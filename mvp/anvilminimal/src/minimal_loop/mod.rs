@@ -23,6 +23,7 @@ pub mod repair_target;
 pub mod route_unbound_recovery;
 pub mod stagnation_carryover;
 pub mod stagnation_escalation;
+pub mod tool_feedback;
 pub mod verifier_bootstrap;
 pub mod verifier_env;
 

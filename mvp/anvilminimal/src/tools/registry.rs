@@ -89,6 +89,19 @@ impl ToolRegistry {
             "Bash" => {
                 let mut command = required_string(arguments, "command")?.to_string();
                 if let Some(normalization) =
+                    crate::tools::bash::strip_workspace_root_cd_prefix(&command, &context.root)
+                {
+                    eval_events::emit(
+                        context.eval_events_path.as_deref(),
+                        json!({
+                            "event": "workspace_cd_stripped",
+                            "original_prefix": eval_events::body_snippet(&normalization.original_prefix),
+                            "normalized_command": eval_events::body_snippet(&normalization.normalized_command),
+                        }),
+                    );
+                    command = normalization.normalized_command;
+                }
+                if let Some(normalization) =
                     crate::tools::bash::normalize_inspect_command(&command, &context.root)
                 {
                     eval_events::emit(
@@ -396,6 +409,7 @@ fn emit_bash_path_confinement_rejected(
             "path": rejection.path,
             "root": rejection.root,
             "nearest_relative": rejection.nearest_relative,
+            "guidance": rejection.guidance,
         }),
     );
 }
@@ -1248,6 +1262,90 @@ mod tests {
         assert!(message.contains("test0709_camp_003"), "{message}");
         let event_text = std::fs::read_to_string(events).unwrap();
         assert!(event_text.contains(r#""event":"bash_path_confinement_rejected""#));
+    }
+
+    #[test]
+    fn bash_strips_workspace_root_cd_prefix_and_records_event() {
+        let registry = ToolRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("workspace");
+        std::fs::create_dir_all(&root).unwrap();
+        let events = dir.path().join("events.jsonl");
+        let context = ToolContext {
+            root: root.clone(),
+            mode: ExecutionMode::Act,
+            auto_approve: true,
+            interactive_approval: false,
+            offline: false,
+            workspace_policy: WorkspacePolicy::NormalTask,
+            eval_events_path: Some(events.clone()),
+            expected_paths: Vec::new(),
+        };
+        let command = format!("cd '{}' && printf data6-ok > output.txt", root.display());
+
+        let output = registry
+            .execute("Bash", &json!({"command": command}), &context)
+            .unwrap();
+
+        assert!(output.contains("outcome: Success"), "{output}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("output.txt")).unwrap(),
+            "data6-ok"
+        );
+        let event_text = std::fs::read_to_string(events).unwrap();
+        let event: Value = event_text
+            .lines()
+            .find(|line| line.contains(r#""event":"workspace_cd_stripped""#))
+            .map(|line| serde_json::from_str(line).unwrap())
+            .expect("workspace_cd_stripped event");
+        let expected_prefix = format!("cd '{}' &&", root.display());
+        assert_eq!(
+            event.get("original_prefix").and_then(Value::as_str),
+            Some(expected_prefix.as_str())
+        );
+        assert_eq!(
+            event.get("normalized_command").and_then(Value::as_str),
+            Some("printf data6-ok > output.txt")
+        );
+    }
+
+    #[test]
+    fn bash_keeps_outside_root_cd_rejected_with_relative_retry_guidance() {
+        let registry = ToolRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("workspace");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let events = dir.path().join("events.jsonl");
+        let context = ToolContext {
+            root: root.clone(),
+            mode: ExecutionMode::Act,
+            auto_approve: true,
+            interactive_approval: false,
+            offline: false,
+            workspace_policy: WorkspacePolicy::NormalTask,
+            eval_events_path: Some(events.clone()),
+            expected_paths: Vec::new(),
+        };
+        let command = format!("cd '{}' && printf forbidden", outside.display());
+
+        let err = registry
+            .execute("Bash", &json!({"command": command}), &context)
+            .unwrap_err();
+
+        assert_eq!(tool_error_kind(&err), "bash_path_confinement_error");
+        assert!(recoverable_tool_error(&err));
+        assert!(
+            err.to_string()
+                .contains("workspace相対で再実行せよ: outside"),
+            "{err}"
+        );
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains(r#""event":"bash_path_confinement_rejected""#));
+        assert!(event_text.contains(r#""nearest_relative":"outside""#));
+        assert!(event_text.contains(r#""guidance":"workspace相対で再実行せよ: outside""#));
+        assert!(!event_text.contains(r#""event":"workspace_cd_stripped""#));
     }
 
     #[test]

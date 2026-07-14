@@ -37,6 +37,12 @@ pub struct InspectCommandNormalization {
     pub normalized: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceCdNormalization {
+    pub original_prefix: String,
+    pub normalized_command: String,
+}
+
 impl BashOutcome {
     pub fn is_success(&self) -> bool {
         self.kind == BashOutcomeKind::Success
@@ -132,9 +138,12 @@ where
     G: Fn() -> bool,
 {
     let started = Instant::now();
-    let command = normalize_inspect_command(command, root)
-        .map(|normalization| normalization.normalized)
+    let command = strip_workspace_root_cd_prefix(command, root)
+        .map(|normalization| normalization.normalized_command)
         .unwrap_or_else(|| command.to_string());
+    let command = normalize_inspect_command(&command, root)
+        .map(|normalization| normalization.normalized)
+        .unwrap_or(command);
     if let Some(reason) = blocked_reason(&command, offline) {
         return Ok(BashOutcome {
             kind: BashOutcomeKind::Blocked,
@@ -249,6 +258,61 @@ pub fn normalize_inspect_command(
         original: original.to_string(),
         normalized,
     })
+}
+
+pub fn strip_workspace_root_cd_prefix(
+    command: &str,
+    root: &Path,
+) -> Option<WorkspaceCdNormalization> {
+    let original = command.trim();
+    let operator = first_unquoted_and_and(original)?;
+    let prefix = original[..operator].trim();
+    let normalized_command = original[(operator + 2)..].trim();
+    if normalized_command.is_empty() {
+        return None;
+    }
+    let words = shell_words(prefix)?;
+    if words.len() != 2 || words[0] != "cd" {
+        return None;
+    }
+    let target = Path::new(&words[1]);
+    if !target.is_absolute() {
+        return None;
+    }
+    let target = target.canonicalize().ok()?;
+    let root = root.canonicalize().ok()?;
+    if target != root {
+        return None;
+    }
+    Some(WorkspaceCdNormalization {
+        original_prefix: original[..(operator + 2)].trim().to_string(),
+        normalized_command: normalized_command.to_string(),
+    })
+}
+
+fn first_unquoted_and_and(command: &str) -> Option<usize> {
+    let bytes = command.as_bytes();
+    let mut single = false;
+    let mut double = false;
+    let mut escaped = false;
+    let mut index = 0usize;
+    while index + 1 < bytes.len() {
+        let byte = bytes[index];
+        if escaped {
+            escaped = false;
+            index += 1;
+            continue;
+        }
+        match byte {
+            b'\\' if !single => escaped = true,
+            b'\'' if !double => single = !single,
+            b'"' if !single => double = !double,
+            b'&' if !single && !double && bytes[index + 1] == b'&' => return Some(index),
+            _ => {}
+        }
+        index += 1;
+    }
+    None
 }
 
 fn normalize_recursive_ls(tokens: &[String], root: &Path) -> Option<String> {
@@ -544,6 +608,7 @@ pub struct BashPathConfinementRejection {
     pub path: String,
     pub root: String,
     pub nearest_relative: String,
+    pub guidance: String,
     pub message: String,
 }
 
@@ -558,17 +623,23 @@ pub fn path_confinement_rejection(
             continue;
         }
         let nearest_relative = nearest_relative_form(candidate, &root);
+        let guidance = workspace_relative_retry_guidance(&nearest_relative);
         let root_display = root.to_string_lossy().to_string();
         return Some(BashPathConfinementRejection {
             path: candidate.to_string(),
             root: root_display.clone(),
             nearest_relative: nearest_relative.clone(),
+            guidance: guidance.clone(),
             message: format!(
-                "bash_path_confinement_error: rejected absolute path `{candidate}` outside current workspace root `{root_display}`; use workspace-relative path `{nearest_relative}`"
+                "bash_path_confinement_error: rejected absolute path `{candidate}` outside current workspace root `{root_display}`; use workspace-relative path `{nearest_relative}`; {guidance}"
             ),
         });
     }
     None
+}
+
+pub fn workspace_relative_retry_guidance(nearest_relative: &str) -> String {
+    format!("workspace相対で再実行せよ: {nearest_relative}")
 }
 
 fn truncate_stream(value: &str) -> String {
