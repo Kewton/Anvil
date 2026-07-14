@@ -494,7 +494,7 @@ fn emit_tui_command_stop_with_status(
     let requested_ok = terminal_status.ok();
     let mut completion_snapshot =
         crate::eval_events::latest_completion_snapshot(config.eval_events_path.as_deref());
-    apply_config_completion_metadata(config, &mut completion_snapshot);
+    crate::completion_metadata::apply_config_completion_metadata(config, &mut completion_snapshot);
     let completion = crate::eval_events::project_completion(requested_ok, &completion_snapshot);
     let terminal_status = effective_terminal_status(terminal_status, &completion);
     let ok = terminal_status.ok();
@@ -612,38 +612,6 @@ fn emit_tui_command_stop_with_status(
         );
     }
     if ok { completion } else { event_projection }
-}
-
-fn apply_config_completion_metadata(
-    config: &Config,
-    snapshot: &mut crate::eval_events::CompletionSnapshot,
-) {
-    if let Some(inference) = config.profile_inference {
-        snapshot.profile_inferred = inference.profile.to_string();
-        snapshot.profile_inference_source = inference.source.as_str().to_string();
-    }
-    if snapshot.profile.trim().is_empty() {
-        snapshot.profile = config.profile.clone();
-    }
-    if snapshot.effective_profile.trim().is_empty() {
-        snapshot.effective_profile = snapshot.profile.clone();
-    }
-    if snapshot.prompt_layout.trim().is_empty() {
-        snapshot.prompt_layout = config.prompt_layout.as_str().to_string();
-    }
-    if crate::planner::profile::canonical_profile_name(&snapshot.profile) == "generic" {
-        if snapshot.assurance_level == "static" {
-            snapshot.assurance_reason =
-                crate::eval_events::GENERIC_STATIC_ASSURANCE_REASON.to_string();
-        } else {
-            snapshot.assurance_level = "reduced".to_string();
-            snapshot.assurance_reason =
-                crate::eval_events::GENERIC_REDUCED_ASSURANCE_REASON.to_string();
-        }
-    } else {
-        snapshot.assurance_level = "full".to_string();
-        snapshot.assurance_reason.clear();
-    }
 }
 
 fn terminal_status_for_result(
@@ -1085,6 +1053,8 @@ mod tests {
         let projection = emit_tui_command_stop(&cfg, "/ultra-plan-run", &result);
 
         assert_eq!(projection.effective_profile, "nextjs");
+        assert_eq!(projection.assurance_level, "partial");
+        assert_eq!(projection.assurance_reason, "acceptance_not_full_success");
         let event_text = std::fs::read_to_string(&events).unwrap();
         let tui_stop = event_text
             .lines()
@@ -1094,10 +1064,71 @@ mod tests {
             tui_stop.contains(r#""effective_profile":"nextjs""#),
             "{tui_stop}"
         );
+        assert!(
+            tui_stop.contains(r#""assurance_level":"partial""#),
+            "{tui_stop}"
+        );
+        assert!(
+            tui_stop.contains(r#""assurance_reason":"acceptance_not_full_success""#),
+            "{tui_stop}"
+        );
         assert!(!tui_stop.contains("generic_profile_reduced_assurance"));
         let summary = std::fs::read_to_string(events.parent().unwrap().join("summary.md")).unwrap();
         assert!(summary.contains("Effective profile: nextjs"), "{summary}");
         assert!(!summary.contains("Assurance: reduced"), "{summary}");
+    }
+
+    #[test]
+    fn data_early_failure_projection_matches_investigation_run_table() {
+        let cases = [
+            (
+                "run1-script-not-generated",
+                false,
+                "failed",
+                "data_profile_script_not_generated",
+            ),
+            (
+                "run2-generated-and-run-outside-contract-probe",
+                true,
+                "static",
+                "data_profile_probe_not_run",
+            ),
+            (
+                "run3-generated-before-confinement-rejection",
+                true,
+                "static",
+                "data_profile_probe_not_run",
+            ),
+            (
+                "run4-generated-before-authority-denial",
+                true,
+                "static",
+                "data_profile_probe_not_run",
+            ),
+        ];
+
+        for (case, pipeline_generated, expected_level, expected_reason) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let workspace = dir.path().join("workspace");
+            let events = workspace.join(".anvil/runs/test/events.jsonl");
+            std::fs::create_dir_all(events.parent().unwrap()).unwrap();
+            if pipeline_generated {
+                std::fs::create_dir_all(workspace.join("pipeline")).unwrap();
+                std::fs::write(workspace.join("pipeline/main.py"), "# generated\n").unwrap();
+            }
+            let mut cfg = config();
+            cfg.workspace_root = workspace;
+            cfg.eval_events_path = Some(events);
+            cfg.profile = "data".to_string();
+            cfg.profile_explicit = true;
+
+            let result: anyhow::Result<String> = Err(anyhow::anyhow!("phase failed"));
+            let projection = emit_tui_command_stop(&cfg, "/ultra-plan-run", &result);
+
+            assert_eq!(projection.effective_profile, "data", "{case}");
+            assert_eq!(projection.assurance_level, expected_level, "{case}");
+            assert_eq!(projection.assurance_reason, expected_reason, "{case}");
+        }
     }
 
     #[test]

@@ -88,6 +88,26 @@ fn unexecuted_probe_is_static_and_never_projects_full() {
     assert!(!dir.path().join("evidence/pipeline-run.json").exists());
 }
 
+#[test]
+fn partial_or_full_requires_both_e1_and_e3_pass_evidence() {
+    for missing_evidence in [
+        checks::RECONCILIATION_EVIDENCE_PATH,
+        checks::RERUN_CONSISTENCY_EVIDENCE_PATH,
+    ] {
+        let (dir, _) = materialize("fabricated-claim.jsonl");
+        let summary = run_manifest_checks(dir.path()).unwrap();
+        assert_eq!(summary.assurance, DataAssurance::Partial);
+
+        std::fs::remove_file(dir.path().join(missing_evidence)).unwrap();
+
+        assert_eq!(
+            assurance_from_evidence(dir.path()),
+            DataAssurance::Failed,
+            "missing {missing_evidence} must not project partial or full"
+        );
+    }
+}
+
 fn materialize(name: &str) -> (tempfile::TempDir, DataFixture) {
     let fixture = load_fixture(name);
     let dir = tempfile::tempdir().unwrap();

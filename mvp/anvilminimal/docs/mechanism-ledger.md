@@ -273,6 +273,7 @@ Both report directories below were present when this closure was recorded.
 | ID | 機構 | コミット | 動機 | 検証 | 状態 |
 |---|---|---|---|---|---|
 | T29 | プローブdispatch契約駆動化 | なし（試行→全revert） | 過適応監査: `interaction_probe` のゲーム操作直書き（ArrowLeft/ArrowRight/Space）の宣言化 | パリティ計測5/6×2回で退行（Space/qwen35、Breakout/qwen35 が偽陰性化）。ゲーム入力判定がdispatch直後のlistener/rAFタイミングと癒着しており、宣言化にはプローブのタイミングモデル再設計が必要と判明 | **withdrawn** |
+| T30 | assurance投影のprofile dispatch | 本コミット | data早期失敗が汎用full seedによりpartialへインフレした契約違反を、[investigation-01.md](../../../workspace/management/runs/uat-test0713-data-001/investigation-01.md) に基づき厳格化方向へ修正 | data 4-run判定表、E1/E3未達negative conformance、Next.js早期失敗互換 | **fixed** |
 
 - 据え置きの根拠: 実害ゼロ（非ゲームは候補要素クリック経路が補完、バンド窓78runで本件起因の偽陰性/偽陽性ゼロ）に対し、修正には裁定層のタイミング再設計を要するため、コストが見合わない。
 - 再訪条件: (a) 第4のシナリオ族でdispatch不足起因の偽陰性が実測されたとき、(b) 近縁profile（Vue等）がプローブ拡張を要求したとき。再訪時はタイミングモデル再設計（listener登録待ち・rAF同期・リトライ付きdispatch）を含む適正スコープで行う。

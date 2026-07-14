@@ -4,6 +4,7 @@ pub mod bounded_process;
 pub mod build_info;
 pub mod cli;
 mod cli_panic_boundary;
+mod completion_metadata;
 pub mod config;
 pub mod eval_events;
 pub mod minimal_loop;
@@ -382,7 +383,7 @@ fn emit_direct_command_stop_with_status(
     let requested_ok = requested_status.ok();
     let mut completion_snapshot =
         eval_events::latest_completion_snapshot(config.eval_events_path.as_deref());
-    apply_config_completion_metadata(config, &mut completion_snapshot);
+    completion_metadata::apply_config_completion_metadata(config, &mut completion_snapshot);
     let completion = eval_events::project_completion(requested_ok, &completion_snapshot);
     let terminal_status = effective_direct_status(requested_status, &completion);
     let ok = terminal_status.ok();
@@ -634,7 +635,7 @@ fn emit_run_stop(config: &Config, result: &anyhow::Result<()>) {
     };
     let mut completion_snapshot =
         eval_events::latest_completion_snapshot(config.eval_events_path.as_deref());
-    apply_config_completion_metadata(config, &mut completion_snapshot);
+    completion_metadata::apply_config_completion_metadata(config, &mut completion_snapshot);
     let terminal_stop =
         eval_events::latest_tui_command_stop_event(config.eval_events_path.as_deref());
     let terminal_ok = terminal_stop
@@ -725,36 +726,6 @@ fn render_terminal_summary_card_to_stdout(
     let card = eval_events::render_terminal_summary_card(path, stop_reason, projection);
     let renderer = TerminalMarkdownRenderer::for_stdout();
     let _ = renderer.render_assistant(&card);
-}
-
-fn apply_config_completion_metadata(
-    config: &Config,
-    snapshot: &mut eval_events::CompletionSnapshot,
-) {
-    if let Some(inference) = config.profile_inference {
-        snapshot.profile_inferred = inference.profile.to_string();
-        snapshot.profile_inference_source = inference.source.as_str().to_string();
-    }
-    if snapshot.profile.trim().is_empty() {
-        snapshot.profile = config.profile.clone();
-    }
-    if snapshot.effective_profile.trim().is_empty() {
-        snapshot.effective_profile = snapshot.profile.clone();
-    }
-    if snapshot.prompt_layout.trim().is_empty() {
-        snapshot.prompt_layout = config.prompt_layout.as_str().to_string();
-    }
-    if crate::planner::profile::canonical_profile_name(&snapshot.profile) == "generic" {
-        if snapshot.assurance_level == "static" {
-            snapshot.assurance_reason = eval_events::GENERIC_STATIC_ASSURANCE_REASON.to_string();
-        } else {
-            snapshot.assurance_level = "reduced".to_string();
-            snapshot.assurance_reason = eval_events::GENERIC_REDUCED_ASSURANCE_REASON.to_string();
-        }
-    } else {
-        snapshot.assurance_level = "full".to_string();
-        snapshot.assurance_reason.clear();
-    }
 }
 
 #[cfg(test)]
@@ -992,6 +963,14 @@ mod tests {
             .unwrap();
         assert!(
             run_stop.contains(r#""effective_profile":"nextjs""#),
+            "{run_stop}"
+        );
+        assert!(
+            run_stop.contains(r#""assurance_level":"partial""#),
+            "{run_stop}"
+        );
+        assert!(
+            run_stop.contains(r#""assurance_reason":"acceptance_not_full_success""#),
             "{run_stop}"
         );
         assert!(!run_stop.contains("generic_profile_reduced_assurance"));
